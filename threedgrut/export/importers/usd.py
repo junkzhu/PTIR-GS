@@ -101,7 +101,7 @@ class USDImporter(FormatImporter):
                 f"No Gaussian prim found in USD file: {path}. "
                 f"Expected UsdVol.ParticleField or ParticleField3DGaussianSplat. "
                 f"Prim types in stage: {prim_types}. "
-                f"NuRec (UsdVol::Volume) and other formats are not supported for import."
+                f"UsdVol::Volume and other formats are not supported for import."
             )
 
         logger.info(f"Found Gaussian prim: {gaussian_prim.GetPath()} (type: {gaussian_prim.GetTypeName()})")

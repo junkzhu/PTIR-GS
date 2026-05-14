@@ -168,7 +168,6 @@ class USDExporter(ModelExporter):
     - Background/environment export as DomeLight
     - USDZ packaging (default output)
 
-    For Omniverse/NuRec compatibility, use NuRecExporter instead.
     """
 
     def __init__(
@@ -223,7 +222,7 @@ class USDExporter(ModelExporter):
             filename_stem = Path(ref_stage.filename).stem
             prim_path = f"/World/{filename_stem}"
             prim = stage.OverridePrim(prim_path)
-            # Reference the file (bare filename for in-package resolution; same as NuRec)
+            # Reference the file with a bare filename for in-package resolution.
             prim.GetReferences().AddReference(ref_stage.filename)
 
         return NamedUSDStage(filename="default.usda", stage=stage)

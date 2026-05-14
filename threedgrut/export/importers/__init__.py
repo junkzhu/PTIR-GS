@@ -29,11 +29,9 @@ __all__ = [
 ]
 
 try:
-    from threedgrut.export.importers.nurec_usd import NuRecUSDImporter
     from threedgrut.export.importers.usd import USDImporter
 
     __all__ += [
-        "NuRecUSDImporter",
         "USDImporter",
     ]
 except ImportError as e:

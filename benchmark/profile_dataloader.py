@@ -24,30 +24,30 @@ Usage examples:
 
     # NCore: runs all decode-backend / preload variants and prints comparison
     python benchmark/profile_dataloader.py \\
-        --config-name=apps/ncore_3dgut.yaml \\
+        --config-name=apps/ncore_3dgrt.yaml \\
         path='/tmp/colmap-ppisp/huerstholz/huerstholz.json'
 
     # COLMAP: baseline throughput
     python benchmark/profile_dataloader.py \\
-        --config-name=apps/colmap_3dgut.yaml \\
+        --config-name=apps/colmap_3dgrt.yaml \\
         path='/data/mipnerf360/garden'
 
     # Override benchmark parameters
     python benchmark/profile_dataloader.py \\
-        --config-name=apps/ncore_3dgut.yaml \\
+        --config-name=apps/ncore_3dgrt.yaml \\
         path='/tmp/colmap-ppisp/huerstholz/huerstholz.json' \\
         +benchmark.warmup_iters=20 \\
         +benchmark.measure_iters=200
 
     # Only run specific ncore configs
     python benchmark/profile_dataloader.py \\
-        --config-name=apps/ncore_3dgut.yaml \\
+        --config-name=apps/ncore_3dgrt.yaml \\
         path='/tmp/colmap-ppisp/huerstholz/huerstholz.json' \\
         '+benchmark.configs=[simplejpeg]'
 
     # With cProfile output
     python benchmark/profile_dataloader.py \\
-        --config-name=apps/ncore_3dgut.yaml \\
+        --config-name=apps/ncore_3dgrt.yaml \\
         path='/tmp/colmap-ppisp/huerstholz/huerstholz.json' \\
         +benchmark.cprofiler_output=dataloader.prof
 """

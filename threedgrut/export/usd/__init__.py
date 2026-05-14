@@ -18,7 +18,6 @@ USD export functionality for Gaussian splatting models.
 
 Includes:
 - USDExporter: Main exporter using ParticleField3DGaussianSplat schema (default)
-- NuRecExporter: Legacy exporter for Omniverse NuRec format (backward compat)
 - Writers: USD prim writers for different schemas
 - Utilities: Stage creation, coordinate transforms
 """
@@ -27,12 +26,10 @@ __all__ = []
 
 try:
     from threedgrut.export.usd.exporter import USDExporter
-    from threedgrut.export.usd.nurec.exporter import NuRecExporter
     from threedgrut.export.usd.stage_utils import initialize_usd_stage
 
     __all__ += [
         "USDExporter",
-        "NuRecExporter",
         "initialize_usd_stage",
     ]
 except ModuleNotFoundError as e:

@@ -19,7 +19,6 @@ Export module for 3DGRUT Gaussian Splatting models.
 Provides exporters and importers for various formats:
 - PLY: Standard point cloud format
 - USD: OpenUSD with ParticleField3DGaussianSplat schema (new default)
-- NuRec: Omniverse-compatible USDZ format (legacy)
 
 Transcoding:
     Use the transcode script to convert between formats:
@@ -101,11 +100,9 @@ except ModuleNotFoundError as e:
 try:
     from threedgrut.export.importers.usd import USDImporter
     from threedgrut.export.usd.exporter import USDExporter
-    from threedgrut.export.usd.nurec.exporter import NuRecExporter
 
     __all__ += [
         "USDExporter",  # ParticleField3DGaussianSplat schema
-        "NuRecExporter",  # Omniverse-compatible format
         "USDImporter",
     ]
 except ModuleNotFoundError as e:

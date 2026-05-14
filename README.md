@@ -7,11 +7,7 @@
   <img width="100%" src="assets/nvidia-hq-playground.gif">
 </p>
 
-This repository provides the official implementations of **3D Gaussian Ray Tracing (3DGRT)** and **3D Gaussian Unscented Transform (3DGUT)**. Unlike traditional methods that rely on splatting, 3DGRT performs ray tracing of volumetric Gaussian particles instead. This enables support for distorted cameras with complex, time-dependent effects such as rolling shutters, while also efficiently simulating secondary rays required for rendering phenomena like reflection, refraction, and shadows. However, 3DGRT requires dedicated ray-tracing hardware and remains slower than 3DGS.
-
-To mitigate this limitation, we also propose 3DGUT, which enables support for distorted cameras with complex, time-dependent effects within a rasterization framework, maintaining the efficiency of rasterization methods. By aligning the rendering formulations of 3DGRT and 3DGUT, we introduce a hybrid approach called **3DGRUT**. This technique allows for rendering primary rays via rasterization and secondary rays via ray tracing, combining the strengths of both methods for improved performance and flexibility.
-
-For projects that require a fast, modular, and production-ready Gaussian Splatting framework, we recommend using [gsplat](https://github.com/nerfstudio-project/gsplat), which also provides support for 3DGUT.
+This repository provides the official implementation of **3D Gaussian Ray Tracing (3DGRT)**. Unlike traditional methods that rely on splatting, 3DGRT performs ray tracing of volumetric Gaussian particles instead. This enables support for distorted cameras with complex, time-dependent effects such as rolling shutters, while also efficiently simulating secondary rays required for rendering phenomena like reflection, refraction, and shadows. However, 3DGRT requires dedicated ray-tracing hardware and remains slower than 3DGS.
 
 > __3D Gaussian Ray Tracing: Fast Tracing of Particle Scenes__
 > [Nicolas Moenne-Loccoz*](https://www.linkedin.com/in/nicolas-moënne-loccoz-71040512/?original_referer=https%3A%2F%2Fwww%2Egoogle%2Ecom%2F&originalSubdomain=ca), [Ashkan Mirzaei*](https://ashmrz.github.io), [Or Perel](https://orperel.github.io/), [Riccardo De Lutio](https://riccardodelutio.github.io/), [Janick Martinez Esturo](https://jme.pub/),
@@ -19,17 +15,10 @@ For projects that require a fast, modular, and production-ready Gaussian Splatti
 > _SIGGRAPH Asia 2024 (Journal Track)_
 > __[Project page](https://research.nvidia.com/labs/toronto-ai/3DGRT)&nbsp;/ [Paper](https://research.nvidia.com/labs/toronto-ai/3DGRT/res/3dgrt_compressed.pdf)&nbsp;/ [Video](https://research.nvidia.com/labs/toronto-ai/3DGRT/res/3dgrt_supplementary_video.mp4)&nbsp;/ [BibTeX](assets/3dgrt2024.bib)__
 
-> __3DGUT: Enabling Distorted Cameras and Secondary Rays in Gaussian Splatting__
-> [Qi Wu*](https://wilsoncernwq.github.io/), [Janick Martinez Esturo*](https://jme.pub/), [Ashkan Mirzaei](https://ashmrz.github.io),
-> [Nicolas Moenne-Loccoz](https://www.linkedin.com/in/nicolas-moënne-loccoz-71040512/?original_referer=https%3A%2F%2Fwww%2Egoogle%2Ecom%2F&originalSubdomain=ca), [Zan Gojcic](https://zgojcic.github.io/)  _(* indicates equal contribution)_
-> _CVPR 2025 (Oral)_
-> __[Project page](https://research.nvidia.com/labs/toronto-ai/3DGUT)&nbsp;/ [Paper](https://research.nvidia.com/labs/toronto-ai/3DGUT/res/3DGUT_ready_main.pdf)&nbsp;/ [Video](https://research.nvidia.com/labs/toronto-ai/3DGUT/#supp_video)&nbsp;/ [BibTeX](assets/3dgut2025.bib)__
-
-
 ## 🔥 News
 - ✅[2026/03] **NCore v4:** Support for training from NCore v4 datasets ([NCore](https://github.com/NVIDIA/ncore), [commands](#training-on-ncore-v4-datasets)).
 - ✅[2026/01] Physically-Plausible ISP support.
-- ✅[2025/08] Support for the 3DGRT and 3DGS/3DGRT pipelines is now available with the Vulkan API as part of the [Vulkan Gaussian Splatting Project](https://github.com/nvpro-samples/vk_gaussian_splatting). 3DGUT will also be available soon.
+- ✅[2025/08] Support for the 3DGRT and 3DGS/3DGRT pipelines is now available with the Vulkan API as part of the [Vulkan Gaussian Splatting Project](https://github.com/nvpro-samples/vk_gaussian_splatting).
 - ✅[2025/07] Support for datasets with multiple sensors (only for COLMAP-style datasets).
 - ✅[2025/07] Support for Windows has been added.
 - ✅[2025/06] Playground supports PBR meshes and environment maps.
@@ -38,7 +27,6 @@ For projects that require a fast, modular, and production-ready Gaussian Splatti
 - ✅[2025/04] MCMC densification strategy support.
 - ✅[2025/04] Stable release [v1.0.0](https://github.com/nv-tlabs/3dgrut/releases/tag/v1.0.0) tagged.
 - ✅[2025/03] Initial code release!
-- ✅[2025/02] [3DGUT](https://research.nvidia.com/labs/toronto-ai/3DGUT/res/3DGUT_ready_main.pdf) was accepted to CVPR 2025!
 - ✅[2024/08] [3DGRT](https://research.nvidia.com/labs/toronto-ai/3DGRT/res/3dgrt_compressed.pdf) was accepted to SIGGRAPH Asia 2024!
 
 ## Contents
@@ -47,7 +35,7 @@ For projects that require a fast, modular, and production-ready Gaussian Splatti
 - [Contents](#contents)
 - [🔧 1 Dependencies and Installation](#-1-dependencies-and-installation)
   - [Running with Docker](#running-with-docker)
-- [💻 2. Train 3DGRT or 3DGUT scenes](#-2-train-3dgrt-or-3dgut-scenes)
+- [💻 2. Train 3DGRT scenes](#-2-train-3dgrt-scenes)
   - [Training on NCore v4 datasets](#training-on-ncore-v4-datasets)
   - [Using image masks](#using-image-masks)
   - [Exporting USDZ for use in Omniverse and Isaac Sim](#exporting-usdz-for-use-in-omniverse-and-isaac-sim)
@@ -218,25 +206,22 @@ docker run -v --rm -it --gpus=all --net=host --ipc=host -v $PWD:/workspace --run
 > [!NOTE]
 > Remember to set the DISPLAY environment variable if you are running on a remote server from the command line.
 
-## 💻 2. Train 3DGRT or 3DGUT scenes
+## 💻 2. Train 3DGRT scenes
 
-We provide different configurations for training using 3DGRT and 3DGUT models on common benchmark datasets.
+We provide different configurations for training using 3DGRT models on common benchmark datasets.
 For example, you can download the [NeRF Synthetic dataset](https://www.kaggle.com/datasets/nguyenhung1903/nerf-synthetic-dataset),
 the [MipNeRF360 dataset](https://jonbarron.info/mipnerf360/), or [ScanNet++](https://kaldir.vc.in.tum.de/scannetpp/),
 and then run one of the following commands:
 
 ```bash
-# Train Lego with 3DGRT & 3DGUT
+# Train Lego with 3DGRT
 python train.py --config-name apps/nerf_synthetic_3dgrt.yaml path=data/nerf_synthetic/lego out_dir=runs experiment_name=lego_3dgrt
-python train.py --config-name apps/nerf_synthetic_3dgut.yaml path=data/nerf_synthetic/lego out_dir=runs experiment_name=lego_3dgut
 
 # Train Bonsai
 python train.py --config-name apps/colmap_3dgrt.yaml path=data/mipnerf360/bonsai out_dir=runs experiment_name=bonsai_3dgrt dataset.downsample_factor=2
-python train.py --config-name apps/colmap_3dgut.yaml path=data/mipnerf360/bonsai out_dir=runs experiment_name=bonsai_3dgut dataset.downsample_factor=2
 
 # Train Scannet++
 python train.py --config-name apps/scannetpp_3dgrt.yaml path=data/scannetpp/0a5c013435/dslr out_dir=runs experiment_name=0a5c013435_3dgrt
-python train.py --config-name apps/scannetpp_3dgut.yaml path=data/scannetpp/0a5c013435/dslr out_dir=runs experiment_name=0a5c013435_3dgut
 ```
 
 ### Training on NCore v4 datasets
@@ -244,25 +229,21 @@ python train.py --config-name apps/scannetpp_3dgut.yaml path=data/scannetpp/0a5c
 Set `path` to your **NCore v4 sequence JSON**. Data layout and tooling are described in the open-source [**NCore**](https://github.com/NVIDIA/ncore) repository. Training defaults are in `configs/dataset/ncore.yaml`.
 
 ```bash
-python train.py --config-name apps/ncore_3dgut.yaml      path=<path>/<sequence-meta>.json out_dir=runs experiment_name=ncore_3dgut
-python train.py --config-name apps/ncore_3dgut_mcmc.yaml path=<path>/<sequence-meta>.json out_dir=runs experiment_name=ncore_3dgut_mcmc
 python train.py --config-name apps/ncore_3dgrt.yaml      path=<path>/<sequence-meta>.json out_dir=runs experiment_name=ncore_3dgrt
 python train.py --config-name apps/ncore_3dgrt_mcmc.yaml path=<path>/<sequence-meta>.json out_dir=runs experiment_name=ncore_3dgrt_mcmc
 # Example overrides: dataset.downsample=0.5 num_workers=8
 ```
 
-We also support the MCMC densification strategy and the selective Adam optimizer for 3DGRT and 3DGUT.
+We also support the MCMC densification strategy and the selective Adam optimizer for 3DGRT.
 
 To enable MCMC, use:
 ```bash
 python train.py --config-name apps/colmap_3dgrt_mcmc.yaml path=data/mipnerf360/bonsai out_dir=runs experiment_name=bonsai_3dgrt dataset.downsample_factor=2
-python train.py --config-name apps/colmap_3dgut_mcmc.yaml path=data/mipnerf360/bonsai out_dir=runs experiment_name=bonsai_3dgut dataset.downsample_factor=2
 ```
 
 To enable selective Adam, use:
 ```bash
 python train.py --config-name apps/colmap_3dgrt.yaml path=data/mipnerf360/bonsai out_dir=runs experiment_name=bonsai_3dgrt dataset.downsample_factor=2 optimizer.type=selective_adam
-python train.py --config-name apps/colmap_3dgut.yaml path=data/mipnerf360/bonsai out_dir=runs experiment_name=bonsai_3dgut dataset.downsample_factor=2 optimizer.type=selective_adam
 ```
 
 If you use MCMC and Selective Adam in your research, please cite [3dgs-mcmc](https://github.com/ubc-vision/3dgs-mcmc), [taming-3dgs](https://github.com/humansensinglab/taming-3dgs),
@@ -289,7 +270,7 @@ As a beta feature, Omniverse Kit 107.3 and Isaac Sim 5.0 are able to support ren
 The 3DGRUT repository can output trained scenes to this format by enabling the `export_usd` flag:
 
 ```bash
-python train.py --config-name apps/colmap_3dgut.yaml path=data/mipnerf360/garden/ out_dir=runs experiment_name=garden_3dgut dataset.downsample_factor=2 export_usd.enabled=true
+python train.py --config-name apps/colmap_3dgrt.yaml path=data/mipnerf360/garden/ out_dir=runs experiment_name=garden_3dgrt dataset.downsample_factor=2 export_usd.enabled=true
 ```
 
 > [!NOTE]
@@ -297,27 +278,14 @@ python train.py --config-name apps/colmap_3dgut.yaml path=data/mipnerf360/garden
 
 #### Converting PLY files to USDZ
 
-If you have existing Gaussian data in PLY format, for example, from 3DGS, you can convert it to the USDZ format using the `ply_to_usd.py` script:
+If you have existing Gaussian data in PLY format, for example, from 3DGS, you can convert it to the USDZ format using the transcode script:
 
 ```bash
-python -m threedgrut.export.scripts.ply_to_usd path/to/your/model.ply --output_file path/to/output.usdz
+python -m threedgrut.export.scripts.transcode path/to/your/model.ply --output path/to/output.usdz --format lightfield
 ```
 
-This is useful for converting 3DGS models from other sources to the USDZ format. Note that the resulting USDZ does not include a mesh. If you need a mesh inside the USDZ (e.g. for collision geometry), follow the next step.
+This is useful for converting 3DGS models from other sources to the USDZ format.
 
-#### Adding a Mesh to a USDZ File
-
-You can add a mesh (PLY or USD) into an existing USDZ file using the `add_mesh_to_usdz.py` script. This is useful for producing USDZ assets with physics properties such as collision geometry.
-
-
-```bash
-python -m threedgrut.export.scripts.add_mesh_to_usdz --input_usdz path/to/input.usdz --output_usdz path/to/output.usdz --mesh_ply path/to/mesh.ply --set_collision
-```
-
-Optional flags:
-- `--set_collision` — enable collision on mesh prims.
-- `--set_invisible` — make mesh prims invisible.
-- `--referencing_usd` — specify which USD file in the package to modify (default: auto-detect the one with a Volume prim).
 
 ## 🎥 3. Rendering from Checkpoints
 Evaluate a checkpoint with splatting, the OptiX tracer, or PyTorch:
@@ -327,14 +295,14 @@ python render.py --checkpoint runs/lego/ckpt_last.pt --out-dir outputs/eval
 
 ### To visualize training progress interactively
 ```bash
-python train.py --config-name apps/nerf_synthetic_3dgut.yaml path=data/nerf_synthetic/lego with_gui=True
+python train.py --config-name apps/nerf_synthetic_3dgrt.yaml path=data/nerf_synthetic/lego with_gui=True
 ```
 > [!NOTE]
 > Remember to set the DISPLAY environment variable if you are running on a remote server from the command line.
 
 Alternatively, use the viser GUI contributed by the community (@tangkangqi):
 ```bash
-python train.py --config-name apps/nerf_synthetic_3dgut.yaml path=data/nerf_synthetic/lego with_viser_gui=True
+python train.py --config-name apps/nerf_synthetic_3dgrt.yaml path=data/nerf_synthetic/lego with_viser_gui=True
 ```
 > [!NOTE]
 > Remember to install viser first via `pip install viser` and forward the port 8080 to your local machine if you are running on a remote server.
@@ -342,7 +310,7 @@ python train.py --config-name apps/nerf_synthetic_3dgut.yaml path=data/nerf_synt
 
 ### To visualize a pre-trained checkpoint
 ```bash
-python train.py --config-name apps/nerf_synthetic_3dgut.yaml path=data/nerf_synthetic/lego with_gui=True test_last=False export_ingp.enabled=False resume=runs/lego/ckpt_last.pt
+python train.py --config-name apps/nerf_synthetic_3dgrt.yaml path=data/nerf_synthetic/lego with_gui=True test_last=False export_ingp.enabled=False resume=runs/lego/ckpt_last.pt
 ```
 
 On startup, you might see a black screen, but you can use the GUI to navigate to the correct camera views:
@@ -358,9 +326,9 @@ We provide scripts to reproduce results reported in publications.
 
 ```bash
 # Training
-bash ./benchmark/mipnerf360_3dgut.sh <config-yaml>
+bash ./benchmark/mipnerf360.sh <config-yaml>
 # Rendering
-bash ./benchmark/mipnerf360_3dgut_render.sh <results-folder>
+bash ./benchmark/mipnerf360_render.sh <results-folder>
 ```
 
 <details>
@@ -410,108 +378,6 @@ bash ./benchmark/mipnerf360_render.sh results/mipnerf360
 </details>
 
 
-<details>
-<summary><strong><a name="gut-benchmark">3DGUT Results Produced on RTX 5090</a></strong></summary>
-<br/>
-
-**NeRF Synthetic Dataset**
-
-```bash
-bash ./benchmark/nerf_synthetic.sh paper/3dgut/unsorted_nerf_synthetic.yaml
-bash ./benchmark/nerf_synthetic_render.sh results/nerf_synthetic
-```
-
-|            | PSNR	  | SSIM	| Train (s) |	FPS |
-|------------|--------|-------|-------|------|
-| Chair      | 35.61	| 0.988	| 265.6	| 599  |
-| Drums      | 25.99	| 0.953	| 254.1	| 694  |
-| Ficus      | 36.43	| 0.988	| 183.5	| 1053 |
-| Hotdog     | 38.11	| 0.986	| 184.8	| 952  |
-| Lego       | 36.47	| 0.984	| 221.7	| 826  |
-| Materials  | 30.39	| 0.960	| 194.3	| 1000 |
-| Mic        | 36.32	| 0.992	| 204.7	| 775  |
-| Ship       | 31.72	| 0.908	| 208.5	| 870  |
-| *Average*  | 33.88	| 0.970	| 214.6	| 846  |
-
-
-**MipNeRF360 Dataset**
-
-GS Strategy, Unsorted
-
-```bash
-bash ./benchmark/mipnerf360.sh paper/3dgut/unsorted_colmap.yaml
-bash ./benchmark/mipnerf360_render.sh results/mipnerf360
-```
-
-|           | PSNR  | SSIM	| Train (s) |	FPS |
-|-----------|-------|-------|-------|------|
-| Bicycle   | 25.01	| 0.759	| 949.8	| 275 |
-| Bonsai    | 32.46	| 0.945	| 485.3	| 362 |
-| Counter   | 29.14	| 0.911	| 484.5	| 380 |
-| Flowers   | 21.45	| 0.612	| 782.0	| 253 |
-| Garden    | 27.18	| 0.856	| 810.2	| 316 |
-| Kitchen   | 31.16	| 0.928	| 664.8	| 275 |
-| Room      | 31.63	| 0.920	| 448.8	| 370 |
-| Stump     | 26.50	| 0.773	| 742.6	| 319 |
-| Treehill  | 22.35	| 0.627	| 809.6	| 299 |
-| *Average* | 27.43	| 0.815	| 686.4	| 317 |
-
-
-MCMC Strategy, Unsorted
-
-```bash
-bash ./benchmark/mipnerf360.sh paper/3dgut/unsorted_colmap_mcmc.yaml
-bash ./benchmark/mipnerf360_render.sh results/mipnerf360
-```
-|           | PSNR  | SSIM	| Train (s) |	FPS |
-|-----------|-------|-------|-------|------|
-| Bicycle   | 25.31	| 0.765	| 502.3	| 361 |
-| Bonsai    | 32.51	| 0.947	| 670.6	| 274 |
-| Counter   | 29.40	| 0.916	| 752.7	| 254 |
-| Flowers   | 21.86	| 0.616	| 553.3	| 298 |
-| Garden    | 27.06	| 0.852	| 512.7	| 360 |
-| Kitchen   | 31.71	| 0.930	| 739.6	| 258 |
-| Room      | 32.04	| 0.928	| 643.7	| 313 |
-| Stump     | 27.06	| 0.795	| 487.0	| 339 |
-| Treehill  | 23.11	| 0.650	| 508.6	| 365 |
-| *Average* | 27.78	| 0.822	| 596.7	| 308 |
-
-GS Strategy, Unsorted, Sparse Adam
-
-|           | PSNR   | SSIM  | Train (s) | FPS |
-|-----------|--------|-------|-----------|-----|
-| Bicycle   | 25.04  | 0.759 | 835.2     | -   |
-| Bonsai    | 32.63  | 0.945 | 457.1     | -   |
-| Counter   | 29.12  | 0.911 | 468.8     | -   |
-| Flowers   | 21.55  | 0.614 | 741.7     | -   |
-| Garden    | 27.12  | 0.855 | 757.4     | -   |
-| Kitchen   | 31.37  | 0.929 | 639.3     | -   |
-| Room      | 31.72  | 0.921 | 415.2     | -   |
-| Stump     | 26.58  | 0.774 | 695.7     | -   |
-| Treehill  | 22.30  | 0.625 | 749.8     | -   |
-| *Average* | 27.49  | 0.815 | 640.0     | -   |
-
-
-**Scannet++ Dataset**
-
-```bash
-bash ./benchmark/scannetpp.sh paper/3dgut/unsorted_scannetpp.yaml
-bash ./benchmark/scannetpp_render.sh results/scannetpp
-```
-> [!Note]
-> We followed [FisheyeGS](https://github.com/zmliao/Fisheye-GS?tab=readme-ov-file#prepare-training-data-on-scannet-dataset)'s convention to prepare the dataset for fair comparisons.
-
-|           | PSNR  | SSIM	| Train (s) |	FPS |
-|-----------|-------|-------|-------|------|
-| 0a5c013435 | 29.67	| 0.930	| 292.3	| 389 |
-| 8d563fc2cc | 26.88	| 0.912	| 286.1	| 439 |
-| bb87c292ad | 31.58	| 0.941	| 316.9	| 448 |
-| d415cc449b | 28.12	| 0.871	| 394.6	| 483 |
-| e8ea9b4da8 | 33.47	| 0.954	| 280.8	| 394 |
-| fe1733741f | 25.60	| 0.858	| 355.8	| 450 |
-| *Average*  | 29.22	| 0.911	| 321.1	| 434 |
-
-</details>
 
 ## 🛝 5. Interactive Playground GUI
 
@@ -546,14 +412,6 @@ Formatting uses `black` and `isort`. Please run
 }
 ```
 
-```
-@article{wu20253dgut,
-    title={3DGUT: Enabling Distorted Cameras and Secondary Rays in Gaussian Splatting},
-    author={Wu, Qi and Martinez Esturo, Janick and Mirzaei, Ashkan and Moenne-Loccoz, Nicolas and Gojcic, Zan},
-    journal = {Conference on Computer Vision and Pattern Recognition (CVPR)},
-    year={2025}
-}
-```
 
 ## 🙏 8. Acknowledgements
 

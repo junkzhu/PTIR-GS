@@ -25,7 +25,6 @@ from plyfile import PlyData, PlyElement
 
 import threedgrt_tracer
 import threedgrut.model.background as background
-import threedgut_tracer
 from threedgrut.datasets.protocols import Batch
 from threedgrut.datasets.utils import read_colmap_points3D_text, read_next_bytes
 from threedgrut.export import PLYExporter
@@ -194,8 +193,6 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         # Rendering method
         if conf.render.method == "3dgrt":
             self.renderer = threedgrt_tracer.Tracer(conf)
-        elif conf.render.method == "3dgut":
-            self.renderer = threedgut_tracer.Tracer(conf)
         else:
             raise ValueError(f"Unknown rendering method: {conf.render.method}")
 

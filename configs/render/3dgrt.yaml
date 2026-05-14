@@ -1,4 +1,4 @@
-method: 3dgrt # 3dgrt or 3dgut
+method: 3dgrt
   
 pipeline_type: reference
 backward_pipeline_type: ${render.pipeline_type}Bwd

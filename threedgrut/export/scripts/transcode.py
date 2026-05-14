@@ -19,19 +19,15 @@ Transcode script for converting between Gaussian splatting export formats.
 Supports conversions between:
 - PLY (pre-activation)
 - USD LightField (post-activation)
-- NuRec USD/USDZ (Omniverse format; UsdVol::Volume + .nurec payload)
 
 Usage:
     python -m threedgrut.export.scripts.transcode input.ply -o output.usdz --format lightfield
     python -m threedgrut.export.scripts.transcode input.usdz -o output.ply
-    python -m threedgrut.export.scripts.transcode nurec.usd -o lightfield.usdz --format lightfield
 """
 
 import argparse
 import logging
 import sys
-import tempfile
-import zipfile
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -40,12 +36,10 @@ from threedgrut.export.base import ModelExporter
 from threedgrut.export.formats import PLYExporter
 from threedgrut.export.importers import (
     FormatImporter,
-    NuRecUSDImporter,
     PLYImporter,
     USDImporter,
 )
 from threedgrut.export.usd.exporter import USDExporter
-from threedgrut.export.usd.nurec.exporter import NuRecExporter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -55,58 +49,22 @@ logger = logging.getLogger(__name__)
 OUTPUT_FORMATS = {
     "ply": "PLY point cloud format (pre-activation values)",
     "lightfield": "USD ParticleField3DGaussianSplat schema (post-activation values)",
-    "nurec": "NuRec USDZ format for Omniverse",
 }
 
 
-def _is_nurec_stage(stage_path: Path) -> bool:
-    """Return True if the USD stage contains a NuRec Volume prim."""
-    from pxr import Usd
-
-    stage = Usd.Stage.Open(str(stage_path))
-    if not stage:
-        return False
-    for prim in stage.Traverse():
-        if prim.GetTypeName() != "Volume":
-            continue
-        attr = prim.GetAttribute("omni:nurec:isNuRecVolume")
-        if attr.IsValid() and attr.Get():
-            return True
-    return False
-
-
 def detect_input_format(path: Path) -> str:
-    """Detect input format from file extension and, for USD, from stage content.
+    """Detect input format from file extension.
 
     Args:
         path: Input file path
 
     Returns:
-        Format string: 'ply', 'nurec', or 'lightfield'
+        Format string: 'ply' or 'lightfield'
     """
     suffix = path.suffix.lower()
     if suffix == ".ply":
         return "ply"
     elif suffix in [".usd", ".usda", ".usdc", ".usdz"]:
-        # Refine to NuRec vs Lightfield by inspecting the stage
-        if suffix == ".usdz":
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmpdir_path = Path(tmpdir)
-                with zipfile.ZipFile(path, "r") as zf:
-                    zf.extractall(tmpdir_path)
-                usd_files = list(tmpdir_path.glob("*.usd*"))
-                root_file = None
-                for f in usd_files:
-                    if f.stem == "default":
-                        root_file = f
-                        break
-                if root_file is None and usd_files:
-                    root_file = usd_files[0]
-                if root_file is not None and _is_nurec_stage(root_file):
-                    return "nurec"
-        else:
-            if _is_nurec_stage(path):
-                return "nurec"
         return "lightfield"
     else:
         raise ValueError(f"Unknown input format for extension: {suffix}")
@@ -116,7 +74,7 @@ def get_importer(format_name: str, max_sh_degree: int = 3) -> FormatImporter:
     """Get importer for the specified format.
 
     Args:
-        format_name: Format name ('ply', 'lightfield', 'nurec')
+        format_name: Format name ('ply', 'lightfield')
         max_sh_degree: Maximum SH degree for PLY importer
 
     Returns:
@@ -126,8 +84,6 @@ def get_importer(format_name: str, max_sh_degree: int = 3) -> FormatImporter:
         return PLYImporter(max_sh_degree=max_sh_degree)
     elif format_name == "lightfield":
         return USDImporter()
-    elif format_name == "nurec":
-        return NuRecUSDImporter()
     else:
         raise ValueError(f"Unknown input format: {format_name}")
 
@@ -143,7 +99,7 @@ def get_exporter(
     """Get exporter for the specified format.
 
     Args:
-        format_name: Format name ('ply', 'lightfield', 'nurec')
+        format_name: Format name ('ply', 'lightfield')
         half_precision: If True, use half for both geometry and features (LightField). Backward compat.
         half_geometry: Use half precision for positions, orientations, scales (LightField only).
         half_features: Use half precision for opacities and SH coefficients (LightField only).
@@ -171,8 +127,6 @@ def get_exporter(
             ),
             False,
         )
-    elif format_name == "nurec":
-        return NuRecExporter(), True
     else:
         raise ValueError(f"Unknown output format: {format_name}")
 
@@ -216,7 +170,7 @@ def transcode(
         half_precision: If True, use half for both geometry and features (LightField). Backward compat.
         half_geometry: Use half for positions, orientations, scales (LightField only).
         half_features: Use half for opacities and SH coefficients (LightField only).
-        apply_coordinate_transform: Apply 3DGRUT-to-USDZ transform (for both lightfield and nurec)
+        apply_coordinate_transform: Apply 3DGRUT-to-USDZ transform.
         render_order_hint: If set, force sortingModeHint for lightfield only; ignored for other formats (warning logged).
         linear_srgb: If True, set prim color space to lin_rec709_scene (lightfield only).
     """
@@ -255,13 +209,6 @@ def transcode(
         is_preactivation=source_is_preactivation,
     )
 
-    # NuRec export always produces USDZ (zip). Require .usdz extension.
-    if output_format == "nurec" and output_path.suffix.lower() != ".usdz":
-        raise ValueError(
-            f"NuRec format requires output extension .usdz, got '{output_path.suffix}'. "
-            f"Use e.g. -o {output_path.with_suffix('.usdz')}"
-        )
-
     # Export
     logger.info(f"Exporting to {output_path}...")
     exporter.export(adapter, output_path, apply_coordinate_transform=apply_coordinate_transform)
@@ -275,21 +222,15 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Supported formats:
-  Input:  ply, usd/usda/usdc/usdz (auto-detected: LightField vs NuRec)
-  Output: ply, lightfield, nurec
+  Input:  ply, usd/usda/usdc/usdz
+  Output: ply, lightfield
 
 Examples:
   # Convert PLY to USD LightField
   python -m threedgrut.export.scripts.transcode model.ply -o model.usdz --format lightfield
 
-  # Convert NuRec USD to LightField
-  python -m threedgrut.export.scripts.transcode nurec.usd -o lightfield.usdz --format lightfield
-
   # Convert USD to PLY
   python -m threedgrut.export.scripts.transcode model.usdz -o model.ply
-
-  # Convert PLY to NuRec (Omniverse)
-  python -m threedgrut.export.scripts.transcode model.ply -o model.usdz --format nurec
 """,
     )
 
@@ -338,14 +279,14 @@ Examples:
     parser.add_argument(
         "--apply-coordinate-transform",
         action="store_true",
-        help="Apply 3DGRUT-to-USDZ coordinate transform (Omniverse convention). Use for both lightfield and nurec.",
+        help="Apply 3DGRUT-to-USDZ coordinate transform.",
     )
     parser.add_argument(
         "--render-order-hint",
         type=str,
         default=None,
         metavar="MODE",
-        help="Force sortingModeHint for lightfield export (e.g. cameraDistance, zDepth). Ignored with --format ply/nurec (warning only).",
+        help="Force sortingModeHint for lightfield export (e.g. cameraDistance, zDepth). Ignored with --format ply (warning only).",
     )
     parser.add_argument(
         "--linear-srgb",

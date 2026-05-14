@@ -775,16 +775,11 @@ class Trainer3DGRUT:
             exporter.export(self.model, Path(ply_path), dataset=self.train_dataset, conf=conf)
 
         if conf.export_usd.enabled:
-            from threedgrut.export import NuRecExporter, USDExporter
+            from threedgrut.export import USDExporter
 
             # Determine format for filename suffix
-            usdz_format = getattr(conf.export_usd, "format", "nurec")
-            if usdz_format == "standard":
-                format_suffix = "lightfield"
-                exporter = USDExporter.from_config(conf)
-            else:
-                format_suffix = "nurec"
-                exporter = NuRecExporter()
+            format_suffix = "lightfield"
+            exporter = USDExporter.from_config(conf)
 
             # Handle path: if not set or relative, put in output directory
             if conf.export_usd.path:

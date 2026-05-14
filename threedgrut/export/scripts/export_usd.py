@@ -20,9 +20,6 @@ Command-line script for exporting 3DGRUT models to USD format.
 Usage:
     python -m threedgrut.export.scripts.export_usd --checkpoint path/to/checkpoint.pt --output output.usdz
 
-    # Export with NuRec format (Omniverse compatibility)
-    python -m threedgrut.export.scripts.export_usd --checkpoint path/to/checkpoint.pt --output output.usdz --format nurec
-
     # Export without cameras/background
     python -m threedgrut.export.scripts.export_usd --checkpoint path/to/checkpoint.pt --output output.usdz --no-cameras --no-background
 """
@@ -34,7 +31,7 @@ from pathlib import Path
 
 import torch
 
-from threedgrut.export import NuRecExporter, USDExporter
+from threedgrut.export import USDExporter
 from threedgrut.utils.logger import logger
 
 
@@ -46,9 +43,6 @@ def parse_args():
 Examples:
     # Basic export to USDZ (default)
     python -m threedgrut.export.scripts.export_usd -c checkpoint.pt -o output.usdz
-
-    # Export with NuRec format for Omniverse
-    python -m threedgrut.export.scripts.export_usd -c checkpoint.pt -o output.usdz --format nurec
 
     # Export to plain USDA (human-readable)
     python -m threedgrut.export.scripts.export_usd -c checkpoint.pt -o output.usda
@@ -75,15 +69,6 @@ Examples:
         type=str,
         required=True,
         help="Output file path (.usdz, .usda, or .usd)",
-    )
-
-    # Format options
-    parser.add_argument(
-        "--format",
-        type=str,
-        choices=["standard", "nurec"],
-        default="standard",
-        help="USD format to use: 'standard' (ParticleField3DGaussianSplat), 'nurec' (Omniverse)",
     )
 
     # Export options
@@ -224,22 +209,17 @@ def main():
 
                 traceback.print_exc()
 
-    # Create exporter based on format
-    if args.format == "nurec":
-        exporter = NuRecExporter()
-        logger.info("Using NuRec format (Omniverse compatible)")
-    else:
-        half_geometry = args.half_geometry or args.half
-        half_features = args.half_features or args.half
-        exporter = USDExporter(
-            half_geometry=half_geometry,
-            half_features=half_features,
-            export_cameras=not args.no_cameras,
-            export_background=not args.no_background,
-            apply_normalizing_transform=not args.no_transform,
-            linear_srgb=args.linear_srgb,
-        )
-        logger.info("Using ParticleField3DGaussianSplat schema (standard)")
+    half_geometry = args.half_geometry or args.half
+    half_features = args.half_features or args.half
+    exporter = USDExporter(
+        half_geometry=half_geometry,
+        half_features=half_features,
+        export_cameras=not args.no_cameras,
+        export_background=not args.no_background,
+        apply_normalizing_transform=not args.no_transform,
+        linear_srgb=args.linear_srgb,
+    )
+    logger.info("Using ParticleField3DGaussianSplat schema (standard)")
 
     # Export
     try:
