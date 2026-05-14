@@ -14,5 +14,8 @@ loss:
   use_opacity: true
   lambda_opacity: 0.01
 
+  use_mask_entropy: false
+  lambda_mask_entropy: 0.0
+
   use_scale: true
   lambda_scale: 0.01

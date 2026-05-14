@@ -134,6 +134,7 @@ class NeRFDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.poses = []
         self.image_paths = []
         self.mask_paths = []
+        self.gradient_mask_paths = []
         self.normal_paths = []
 
         if split == "trainval":
@@ -159,6 +160,7 @@ class NeRFDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             # We assume that the mask is stored in the same folder as the image with the same name but with _mask.png extension.
             # If the mask does not exist, we will return None in the batch
             self.mask_paths.append(os.path.splitext(img_path)[0] + "_mask.png")
+            self.gradient_mask_paths.append(os.path.splitext(img_path)[0] + "_gradient_mask.png")
 
         self.camera_centers = np.array(cam_centers)
 
@@ -168,6 +170,7 @@ class NeRFDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
         self.image_paths = np.stack(self.image_paths, dtype=str)
         self.mask_paths = np.stack(self.mask_paths, dtype=str)
+        self.gradient_mask_paths = np.stack(self.gradient_mask_paths, dtype=str)
         self.normal_paths = np.stack(self.normal_paths, dtype=str)
         self.poses = np.array(self.poses).astype(np.float32)  # (N_images, 4, 4)
 
@@ -236,10 +239,10 @@ class NeRFDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
     @torch.cuda.nvtx.range("nerf_dataset::_getitem")
     def __getitem__(self, idx) -> dict:
         out_shape = (1, self.image_h, self.image_w, 3)
-        img = NeRFDataset.__read_image(
+        img, alpha = NeRFDataset.__read_image(
             self.image_paths[idx],
             self.img_wh,
-            return_alpha=False,
+            return_alpha=True,
             bg_color=self.bg_color,
         )
 
@@ -262,9 +265,20 @@ class NeRFDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             )
             output_dict["normal"] = torch.tensor(normal).reshape(out_shape)
 
-        if os.path.exists(mask_path := self.mask_paths[idx]):
-            mask = torch.from_numpy(np.array(Image.open(mask_path))).reshape(1, self.image_h, self.image_w, 1)
+        mask_path = self.mask_paths[idx]
+        if os.path.exists(mask_path):
+            mask = torch.from_numpy(np.array(Image.open(mask_path).convert("L"))).reshape(1, self.image_h, self.image_w, 1)
             output_dict["mask"] = mask
+        elif alpha is not None:
+            mask = torch.from_numpy(alpha).reshape(1, self.image_h, self.image_w, 1)
+            output_dict["mask"] = mask
+
+        gradient_mask_path = self.gradient_mask_paths[idx]
+        if os.path.exists(gradient_mask_path):
+            gradient_mask = torch.from_numpy(np.array(Image.open(gradient_mask_path).convert("L"))).reshape(
+                1, self.image_h, self.image_w, 1
+            )
+            output_dict["gradient_mask"] = gradient_mask
 
         return output_dict
 
@@ -294,6 +308,11 @@ class NeRFDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             mask = batch["mask"][0].to(self.device, non_blocking=True) / 255.0
             mask = (mask > 0.5).to(torch.float32)
             sample["mask"] = mask
+
+        if "gradient_mask" in batch:
+            gradient_mask = batch["gradient_mask"][0].to(self.device, non_blocking=True) / 255.0
+            gradient_mask = (gradient_mask > 0.5).to(torch.float32)
+            sample["gradient_mask"] = gradient_mask
 
         if "normal" in batch:
             normal = batch["normal"][0].to(self.device, non_blocking=True) / 255.0
@@ -440,6 +459,7 @@ class NeRFDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
     @staticmethod
     def __read_image(img_path, img_wh, return_alpha=False, bg_color=None):
         img = imageio.imread(img_path).astype(np.float32) / 255.0
+        alpha = None
         # img[..., :3] = srgb_to_linear(img[..., :3])
 
         # Below assume image is float32
@@ -463,8 +483,10 @@ class NeRFDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         assert img.dtype == np.uint8, "Image must be uint8"
 
         if return_alpha:
-            alpha = cv2.resize(alpha, img_wh)
-            alpha = rearrange(alpha, "h w -> (h w)")
+            if alpha is not None:
+                alpha = cv2.resize(alpha, img_wh)
+                alpha = rearrange(alpha, "h w -> (h w)")
+                alpha = (alpha * 255.0).astype(np.uint8)
             return img, alpha
         else:
             return img

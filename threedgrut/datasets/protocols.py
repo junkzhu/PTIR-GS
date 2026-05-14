@@ -32,6 +32,7 @@ class Batch:
     pseudo_normal: Optional[torch.Tensor] = None
     pseudo_normal_mask: Optional[torch.Tensor] = None
     mask: Optional[torch.Tensor] = None
+    gradient_mask: Optional[torch.Tensor] = None
     intrinsics: Optional[list] = None
     intrinsics_OpenCVPinholeCameraModelParameters: Optional[dict] = None
     intrinsics_OpenCVFisheyeCameraModelParameters: Optional[dict] = None
@@ -61,8 +62,11 @@ class Batch:
             assert self.pseudo_normal_mask.ndim == 4, "pseudo_normal_mask must be a 4D tensor [B, H, W, 1]"
             assert self.pseudo_normal_mask.shape[0] == batch_size, "pseudo_normal_mask must have the same batch size"
         if self.mask is not None:
-            assert self.mask.ndim == 4, "mask must be a 3D tensor [B, H, W, 1]"
+            assert self.mask.ndim == 4, "mask must be a 4D tensor [B, H, W, 1]"
             assert self.mask.shape[0] == batch_size, "mask must have the same batch size"
+        if self.gradient_mask is not None:
+            assert self.gradient_mask.ndim == 4, "gradient_mask must be a 4D tensor [B, H, W, 1]"
+            assert self.gradient_mask.shape[0] == batch_size, "gradient_mask must have the same batch size"
         if self.intrinsics:
             assert isinstance(self.intrinsics, list), "intrinsics must be a list"
             assert len(self.intrinsics) == 4, "intrinsics must have 4 elements [fx, fy, cx, cy]"

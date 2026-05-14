@@ -102,6 +102,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         # numpy str array of image paths and mask paths
         self.image_paths = self.image_paths[indices]
         self.mask_paths = self.mask_paths[indices]
+        self.gradient_mask_paths = self.gradient_mask_paths[indices]
 
         self.camera_centers = self.camera_centers[indices]
         self.center, self.length_scale, self.scene_bbox = self.compute_spatial_extents()
@@ -317,6 +318,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.poses = []
         self.image_paths = []
         self.mask_paths = []
+        self.gradient_mask_paths = []
 
         cam_centers = []
         for extr in logger.track(
@@ -337,6 +339,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             image_path = os.path.join(self.path, self.get_images_folder(), extr.name)
             self.image_paths.append(image_path)
             self.mask_paths.append(os.path.splitext(image_path)[0] + "_mask.png")
+            self.gradient_mask_paths.append(os.path.splitext(image_path)[0] + "_gradient_mask.png")
 
         self.camera_centers = np.array(cam_centers)
         _, diagonal = get_center_and_diag(self.camera_centers)
@@ -346,6 +349,7 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
 
         self.image_paths = np.stack(self.image_paths, dtype=str)
         self.mask_paths = np.stack(self.mask_paths, dtype=str)
+        self.gradient_mask_paths = np.stack(self.gradient_mask_paths, dtype=str)
 
     def _lazy_worker_intrinsics_cache(self):
         """Create intrinsics cache for a specific worker."""
@@ -499,6 +503,12 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             mask = torch.from_numpy(np.array(Image.open(mask_path).convert("L"))).reshape(1, actual_h, actual_w, 1)
             output_dict["mask"] = mask
 
+        if os.path.exists(gradient_mask_path := self.gradient_mask_paths[idx]):
+            gradient_mask = torch.from_numpy(np.array(Image.open(gradient_mask_path).convert("L"))).reshape(
+                1, actual_h, actual_w, 1
+            )
+            output_dict["gradient_mask"] = gradient_mask
+
         # Add EXIF exposure if available for this frame
         if self.exif_exposures is not None and self.exif_exposures[idx] is not None:
             output_dict["exposure"] = torch.tensor(self.exif_exposures[idx], dtype=torch.float32)
@@ -535,6 +545,11 @@ class ColmapDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             mask = batch["mask"][0].to(self.device, non_blocking=True) / 255.0
             mask = (mask > 0.5).to(torch.float32)
             sample["mask"] = mask
+
+        if "gradient_mask" in batch:
+            gradient_mask = batch["gradient_mask"][0].to(self.device, non_blocking=True) / 255.0
+            gradient_mask = (gradient_mask > 0.5).to(torch.float32)
+            sample["gradient_mask"] = gradient_mask
 
         # Add exposure prior from EXIF if available (move to GPU)
         if "exposure" in batch and batch["exposure"][0] is not None:

@@ -43,8 +43,8 @@ def pseudo_normal_loss(render_normal, pseudo_normal, valid_mask=None, eps=1e-6):
         valid_mask: Optional bool/float mask shaped [B, H, W, 1], [B, H, W], [H, W, 1], or [H, W].
         eps: Normalization epsilon.
     """
-    n_render = F.normalize(render_normal, dim=-1, eps=eps)
-    n_pseudo = F.normalize(pseudo_normal.detach(), dim=-1, eps=eps)
+    n_render = render_normal
+    n_pseudo = pseudo_normal.detach()
 
     loss = 1.0 - (n_render * n_pseudo).sum(dim=-1)
 
@@ -58,3 +58,35 @@ def pseudo_normal_loss(render_normal, pseudo_normal, valid_mask=None, eps=1e-6):
         return render_normal.sum() * 0.0
 
     return loss.mean()
+
+
+@torch.cuda.nvtx.range("mask_entropy_loss")
+def mask_entropy_loss(pred_opacity, mask, eps=1e-6):
+    """
+    Binary cross-entropy between rendered opacity and a foreground mask.
+
+    Args:
+        pred_opacity: Rendered opacity in [0, 1], shaped [B, H, W, 1] or [B, H, W].
+        mask: Foreground mask, shaped like pred_opacity or with a trailing singleton channel.
+        eps: Clamp epsilon for numerical stability.
+    """
+    if pred_opacity is None:
+        raise ValueError("pred_opacity must be provided for mask_entropy_loss")
+    if mask is None:
+        return pred_opacity.sum() * 0.0
+
+    image_mask = mask.detach().to(device=pred_opacity.device, dtype=pred_opacity.dtype).clamp(0.0, 1.0)
+    rendered_opacity = pred_opacity.clamp(eps, 1.0 - eps)
+
+    if image_mask.ndim == rendered_opacity.ndim - 1:
+        image_mask = image_mask.unsqueeze(-1)
+    elif rendered_opacity.ndim == image_mask.ndim - 1:
+        rendered_opacity = rendered_opacity.unsqueeze(-1)
+
+    if image_mask.shape != rendered_opacity.shape:
+        image_mask = image_mask.expand_as(rendered_opacity)
+
+    return -(
+        image_mask * torch.log(rendered_opacity)
+        + (1.0 - image_mask) * torch.log(1.0 - rendered_opacity)
+    ).mean()

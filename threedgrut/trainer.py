@@ -33,7 +33,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 import threedgrut.datasets as datasets
 from threedgrut.datasets.protocols import BoundedMultiViewDataset
 from threedgrut.datasets.utils import DEFAULT_DEVICE, MultiEpochsDataLoader, PointCloud
-from threedgrut.model.losses import pseudo_normal_loss, ssim
+from threedgrut.model.losses import mask_entropy_loss, pseudo_normal_loss, ssim
 from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.optimizers import SelectiveAdam
 from threedgrut.render import Renderer
@@ -524,11 +524,12 @@ class Trainer3DGRUT:
         rgb_gt = gpu_batch.rgb_gt
         rgb_pred = outputs["pred_rgb"]
         mask = gpu_batch.mask
+        gradient_mask = gpu_batch.gradient_mask
 
-        # Mask out the invalid pixels if the mask is provided
-        if mask is not None:
-            rgb_gt = rgb_gt * mask
-            rgb_pred = rgb_pred * mask
+        # Mask out the invalid pixels if a gradient mask is provided.
+        if gradient_mask is not None:
+            rgb_gt = rgb_gt * gradient_mask
+            rgb_pred = rgb_pred * gradient_mask
 
         # L1 loss
         loss_l1 = torch.zeros(1, device=self.device)
@@ -564,6 +565,16 @@ class Trainer3DGRUT:
                 loss_opacity = torch.abs(self.model.get_density()).mean()
                 lambda_opacity = self.conf.loss.lambda_opacity
 
+        # Mask entropy loss on rendered opacity
+        loss_mask_entropy = torch.zeros(1, device=self.device)
+        lambda_mask_entropy = 0.0
+        if self.conf.loss.get("use_mask_entropy", False):
+            pred_opacity = outputs.get("pred_opacity")
+            if mask is not None and pred_opacity is not None:
+                with torch.cuda.nvtx.range(f"loss-mask-entropy"):
+                    loss_mask_entropy = mask_entropy_loss(pred_opacity, mask)
+                    lambda_mask_entropy = self.conf.loss.lambda_mask_entropy
+
         # Scale regularization
         loss_scale = torch.zeros(1, device=self.device)
         lambda_scale = 0.0
@@ -594,6 +605,7 @@ class Trainer3DGRUT:
             + lambda_l2 * loss_l2
             + lambda_ssim * loss_ssim
             + lambda_opacity * loss_opacity
+            + lambda_mask_entropy * loss_mask_entropy
             + lambda_scale * loss_scale
             + lambda_shading_normal * loss_shading_normal
         )
@@ -603,6 +615,7 @@ class Trainer3DGRUT:
             l2_loss=lambda_l2 * loss_l2,
             ssim_loss=lambda_ssim * loss_ssim,
             opacity_loss=lambda_opacity * loss_opacity,
+            mask_entropy_loss=lambda_mask_entropy * loss_mask_entropy,
             scale_loss=lambda_scale * loss_scale,
             shading_normal_loss=lambda_shading_normal * loss_shading_normal,
         )
@@ -741,6 +754,9 @@ class Trainer3DGRUT:
             if self.conf.loss.use_opacity:
                 opacity_loss = np.mean(batch_metrics["losses"]["opacity_loss"])
                 writer.add_scalar("loss/opacity/train", opacity_loss, global_step)
+            if self.conf.loss.get("use_mask_entropy", False):
+                mask_entropy = np.mean(batch_metrics["losses"]["mask_entropy_loss"])
+                writer.add_scalar("loss/mask_entropy/train", mask_entropy, global_step)
             if self.conf.loss.use_scale:
                 scale_loss = np.mean(batch_metrics["losses"]["scale_loss"])
                 writer.add_scalar("loss/scale/train", scale_loss, global_step)
@@ -990,7 +1006,7 @@ class Trainer3DGRUT:
                     pred_dist=pred_dist,
                     valid=valid,
                     pred_opacity=outputs.get("pred_opacity"),
-                    foreground_mask=gpu_batch.mask,
+                    foreground_mask=gpu_batch.gradient_mask,
                 )
                 gpu_batch.pseudo_normal = pseudo_normal
                 gpu_batch.pseudo_normal_mask = pseudo_normal_mask

@@ -129,6 +129,7 @@ extern "C" __global__ void __raygen__rg() {
     float3 rayRadiance     = make_float3(0.f);
     float rayTransmittance = 1.f;
     float rayHitDistance   = 0.f;
+    float3 rayShadingNormal = make_float3(0.f);
 
     RayPayload rayPayload;
 
@@ -167,6 +168,7 @@ extern "C" __global__ void __raygen__rg() {
                     rayHitDistance,
                     rayHitDistanceGrad,
                     rayIntegratedShadingNormal,
+                    rayShadingNormal,
                     rayShadingNormalGrad);
 
                 startT = fmaxf(startT, rayHit.distance);

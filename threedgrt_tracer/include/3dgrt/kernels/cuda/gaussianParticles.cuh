@@ -492,6 +492,7 @@ __device__ inline void processHitBwd(
     float& depth,
     float depthGrad,
     float3 integratedShadingNormal,
+    float3& shadingnormal,
     float3 shadingNormalGrad) {
     float3 particlePosition;
     float3 gscl;
@@ -599,8 +600,9 @@ __device__ inline void processHitBwd(
             particlesShadingNormal[particleIdx * 3 + 1],
             particlesShadingNormal[particleIdx * 3 + 2]);
         const float3 rayShadingNormal = weight * particleShadingNormal;
+        shadingnormal += rayShadingNormal;
         const float3 residualShadingNormal =
-            (nextTransmit <= minTransmittance ? make_float3(0) : (integratedShadingNormal - rayShadingNormal) / nextTransmit);
+            (nextTransmit <= minTransmittance ? make_float3(0) : (integratedShadingNormal - shadingnormal) / nextTransmit);
 
         atomicAdd(&particlesShadingNormalGrad[particleIdx * 3 + 0], weight * shadingNormalGrad.x);
         atomicAdd(&particlesShadingNormalGrad[particleIdx * 3 + 1], weight * shadingNormalGrad.y);
