@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import time
 from collections import defaultdict
@@ -1161,12 +1162,26 @@ class Trainer3DGRUT:
 
         # Report training statistics
         stats = logger.finished_tasks["Training"]
+        elapsed = float(stats["elapsed"])
+        iteration_speed = self.global_step / elapsed
         table = dict(
             n_steps=f"{self.global_step}",
             n_epochs=f"{self.n_epochs}",
-            training_time=f"{stats['elapsed']:.2f} s",
-            iteration_speed=f"{self.global_step / stats['elapsed']:.2f} it/s",
+            training_time=f"{elapsed:.2f} s",
+            iteration_speed=f"{iteration_speed:.2f} it/s",
         )
+        time_json = dict(
+            n_steps=int(self.global_step),
+            n_epochs=int(self.n_epochs),
+            training_time=float(elapsed),
+            iteration_speed=float(iteration_speed),
+            training_time_text=table["training_time"],
+            iteration_speed_text=table["iteration_speed"],
+        )
+        time_path = os.path.join(self.tracking.output_dir, "time.json")
+        with open(time_path, "w") as f:
+            json.dump(time_json, f, indent=2)
+        logger.info(f"📄 Training time saved to: {time_path}")
         logger.log_table(f"🎊 Training Statistics", record=table)
 
         # Perform testing
