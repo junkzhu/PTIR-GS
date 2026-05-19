@@ -72,6 +72,7 @@ model:
   optimize_position: true
   optimize_rotation: true
   optimize_scale: true
+  optimize_shading_normal: true
   bvh_update_frequency: 1
   progressive_training:
     feature_type: "sh" # one of [sh, mlp], currently only sh supported
@@ -140,7 +141,7 @@ loss:
   use_scale: false
   lambda_scale: 0.0
 
-  use_shading_normal: true
+  use_pseudo_normal_supervision: true
   lambda_shading_normal: 0.05
 
   use_depth_distortion: false

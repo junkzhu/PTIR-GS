@@ -701,6 +701,8 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             self.scale.requires_grad = False
         if not self.conf.model.optimize_position:
             self.positions.requires_grad = False
+        if not self.conf.model.optimize_shading_normal:
+            self.shading_normal.requires_grad = False
 
     def update_optimizable_parameters(self, optimizable_tensors: dict[str, torch.Tensor]):
         for name, value in optimizable_tensors.items():

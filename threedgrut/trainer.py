@@ -616,7 +616,7 @@ class Trainer3DGRUT:
         # Shading normal loss
         loss_shading_normal = torch.zeros(1, device=self.device)
         lambda_shading_normal = 0.0
-        if self.conf.loss.use_shading_normal:
+        if self.conf.loss.use_pseudo_normal_supervision:
             pred_shadingnormal = outputs.get("pred_shadingnormal")
             pseudo_normal = getattr(gpu_batch, "pseudo_normal", None)
             pseudo_normal_mask = getattr(gpu_batch, "pseudo_normal_mask", None)
@@ -839,7 +839,7 @@ class Trainer3DGRUT:
             if self.conf.loss.use_scale:
                 scale_loss = np.mean(batch_metrics["losses"]["scale_loss"])
                 writer.add_scalar("loss/scale/train", scale_loss, global_step)
-            if self.conf.loss.use_shading_normal:
+            if self.conf.loss.use_pseudo_normal_supervision:
                 shading_normal_loss = np.mean(batch_metrics["losses"]["shading_normal_loss"])
                 writer.add_scalar("loss/shading_normal/train", shading_normal_loss, global_step)
             if self.conf.loss.use_normal_prior_regularization:
