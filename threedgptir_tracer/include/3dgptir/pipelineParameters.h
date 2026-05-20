@@ -52,6 +52,7 @@ struct PipelineParameters {
     static constexpr float hitMaxParticleSquaredDistance = 9.f; ///< by design
     float alphaMinThreshold;
     unsigned int sphDegree;
+    unsigned int maxBounces;
 
     uint2 frameBounds;
     unsigned int frameNumber;

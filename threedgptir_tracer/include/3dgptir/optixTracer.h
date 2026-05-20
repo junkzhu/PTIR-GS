@@ -150,7 +150,8 @@ public:
         torch::Tensor particleShadingNormal,
         uint32_t renderOpts,
         int sphDegree,
-        float minTransmittance);
+        float minTransmittance,
+        uint32_t maxBounces);
 
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> virtual traceBwd(
         uint32_t frameNumber,
@@ -179,7 +180,8 @@ public:
         torch::Tensor rayMaterialGrd,
         uint32_t renderOpts,
         int sphDegree,
-        float minTransmittance);
+        float minTransmittance,
+        uint32_t maxBounces);
 
     virtual void buildBVH(torch::Tensor mogPos,
                           torch::Tensor mogRot,

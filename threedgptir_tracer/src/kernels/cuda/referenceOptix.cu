@@ -33,9 +33,10 @@ extern "C" __global__ void __raygen__rg() {
     Sampler sampler;
     sampler.initFromLaunch(idx, params.frameNumber);
 
+    pathPayload path(1u, 0u, params.maxBounces);
     rayPayload payload;
-    rayIntersect(ray, payload);
 
+    rayIntersect(ray, payload);
     writePrimaryRayOutputs(idx, payload);
 }
 

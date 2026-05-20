@@ -862,7 +862,8 @@ OptixTracer::trace(uint32_t frameNumber,
                    torch::Tensor particleShadingNormal,
                    uint32_t renderOpts,
                    int sphDegree,
-                   float minTransmittance) {
+                   float minTransmittance,
+                   uint32_t maxBounces) {
 
     const torch::TensorOptions opts  = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     torch::Tensor rayRad             = torch::empty({rayOri.size(0), rayOri.size(1), rayOri.size(2), 3}, opts);
@@ -889,6 +890,7 @@ OptixTracer::trace(uint32_t frameNumber,
     paramsHost.hitMinGaussianResponse = _state->particleKernelMinResponse;
     paramsHost.alphaMinThreshold      = 1.0f / 255.0f;
     paramsHost.sphDegree              = sphDegree;
+    paramsHost.maxBounces             = maxBounces;
 
     std::memcpy(&paramsHost.rayToWorld[0].x, rayToWorld.cpu().data_ptr<float>(), 3 * sizeof(float4));
     paramsHost.rayOrigin    = packed_accessor32<float, 4>(rayOri);
@@ -954,7 +956,8 @@ OptixTracer::traceBwd(uint32_t frameNumber,
                       torch::Tensor rayMaterialGrd,
                       uint32_t renderOpts,
                       int sphDegree,
-                      float minTransmittance) {
+                      float minTransmittance,
+                      uint32_t maxBounces) {
 
     const torch::TensorOptions opts    = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     torch::Tensor particleDensityGrad  = torch::zeros({particleDensity.size(0), particleDensity.size(1)}, opts);
@@ -975,6 +978,7 @@ OptixTracer::traceBwd(uint32_t frameNumber,
     paramsHost.hitMinGaussianResponse = _state->particleKernelMinResponse;
     paramsHost.alphaMinThreshold      = 1.0f / 255.0f;
     paramsHost.sphDegree              = sphDegree;
+    paramsHost.maxBounces             = maxBounces;
 
     std::memcpy(&paramsHost.rayToWorld[0].x, rayToWorld.cpu().data_ptr<float>(), 3 * sizeof(float4));
     paramsHost.rayOrigin    = packed_accessor32<float, 4>(rayOri);

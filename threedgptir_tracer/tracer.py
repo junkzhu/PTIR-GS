@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import math
 import os
 from enum import IntEnum
 
@@ -21,6 +22,7 @@ import torch
 import torch.utils.cpp_extension
 
 from threedgrut.datasets.protocols import Batch
+from threedgrut.utils.logger import logger as rich_logger
 from threedgrut.utils.timer import CudaTimer
 
 logger = logging.getLogger(__name__)
@@ -68,6 +70,7 @@ class Tracer:
             render_opts,
             sph_degree,
             min_transmittance,
+            max_bounces,
         ):
             particle_density = torch.concat([mog_pos, mog_dns, mog_rot, mog_scl, torch.zeros_like(mog_dns)], dim=1)
             particle_material = torch.concat([mog_malb, mog_mrgh, mog_mmet], dim=1)
@@ -94,6 +97,7 @@ class Tracer:
                 render_opts,
                 sph_degree,
                 min_transmittance,
+                max_bounces,
             )
             ctx.save_for_backward(
                 ray_to_world,
@@ -116,6 +120,7 @@ class Tracer:
             ctx.render_opts = render_opts
             ctx.sph_degree = sph_degree
             ctx.min_transmittance = min_transmittance
+            ctx.max_bounces = max_bounces
             ctx.tracer_wrapper = tracer_wrapper
             return (
                 ray_radiance,
@@ -190,6 +195,7 @@ class Tracer:
                 ctx.render_opts,
                 ctx.sph_degree,
                 ctx.min_transmittance,
+                ctx.max_bounces,
             )
             mog_pos_grd, mog_dns_grd, mog_rot_grd, mog_scl_grd, _ = torch.split(
                 particle_density_grd, [3, 1, 4, 3, 1], dim=1
@@ -215,17 +221,55 @@ class Tracer:
                 None,
                 None,
                 None,
+                None,
             )
 
     class RenderOpts(IntEnum):
         NONE = 0
         DEFAULT = NONE
 
+    _MULTISPP_PATTERNS = {
+        1: ((0.5000, 0.5000),),
+        2: ((0.2500, 0.2500), (0.7500, 0.7500)),
+        4: ((0.3750, 0.1250), (0.8750, 0.3750), (0.6250, 0.8750), (0.1250, 0.6250)),
+        8: (
+            (0.5625, 0.6875),
+            (0.4375, 0.3125),
+            (0.8125, 0.4375),
+            (0.3125, 0.8125),
+            (0.1875, 0.1875),
+            (0.0625, 0.5625),
+            (0.6875, 0.0625),
+            (0.9375, 0.9375),
+        ),
+        16: (
+            (0.5625, 0.4375),
+            (0.4375, 0.6875),
+            (0.3125, 0.3750),
+            (0.7500, 0.5625),
+            (0.1875, 0.6250),
+            (0.6250, 0.1875),
+            (0.1875, 0.3125),
+            (0.6875, 0.8125),
+            (0.3750, 0.1250),
+            (0.5000, 0.9375),
+            (0.2500, 0.8750),
+            (0.1250, 0.2500),
+            (0.0000, 0.5000),
+            (0.9375, 0.7500),
+            (0.8750, 0.0625),
+            (0.0625, 0.0000),
+        ),
+        32: tuple(((x + 0.5) / 8.0, (y + 0.5) / 4.0) for y in range(4) for x in range(8)),
+    }
+
     def __init__(self, conf):
 
         self.device = "cuda"
         self.conf = conf
         self.num_update_bvh = 0
+        self._warned_spp_fallback = False
+        self._logged_spp_config = False
 
         logger.info(f'🔆 Creating threedgptir Optix tracing pipeline.. Using CUDA path: "{torch.utils.cpp_extension.CUDA_HOME}"')
         torch.zeros(1, device=self.device)  # Create a dummy tensor to force cuda context init
@@ -247,6 +291,75 @@ class Tracer:
 
         self.frame_timer = CudaTimer() if self.conf.render.enable_kernel_timings else None
         self.timings = {}
+
+    def _get_spp(self, train: bool) -> int:
+        key = "backward_spp" if train else "forward_spp"
+        return max(1, int(self.conf.render.get(key, 1)))
+
+    def _get_spp_chunk(self, spp: int) -> int:
+        return min(spp, max(1, int(self.conf.render.get("spp_chunk", spp))))
+
+    def _make_spp_jitter(self, spp: int, h: int, w: int, device: torch.device, dtype: torch.dtype, frame_id: int):
+        if spp in self._MULTISPP_PATTERNS:
+            return torch.tensor(self._MULTISPP_PATTERNS[spp], dtype=dtype, device=device).view(spp, 1, 1, 2)
+
+        grid_w = int(math.ceil(math.sqrt(spp)))
+        grid_h = int(math.ceil(spp / grid_w))
+        sample_idx = torch.arange(spp, dtype=dtype, device=device)
+        jitter = torch.stack(
+            (
+                (torch.remainder(sample_idx, grid_w) + 0.5) / grid_w,
+                (torch.div(sample_idx, grid_w, rounding_mode="floor") + 0.5) / grid_h,
+            ),
+            dim=-1,
+        )
+
+        generator = torch.Generator(device=device)
+        generator.manual_seed((int(frame_id) + 1) * 1315423911 + spp * 2654435761)
+        shift = torch.rand((1, 2), dtype=dtype, device=device, generator=generator)
+        return torch.remainder(jitter + shift, 1.0).view(spp, 1, 1, 2)
+
+    def _expand_rays_for_spp(self, gpu_batch: Batch, spp: int, frame_id: int, jitter: torch.Tensor | None = None):
+        rays_ori = gpu_batch.rays_ori.contiguous()
+        rays_dir = gpu_batch.rays_dir.contiguous()
+        if spp == 1 and jitter is None:
+            return rays_ori, rays_dir, 1
+
+        intrinsics = getattr(gpu_batch, "intrinsics", None)
+        pixel_coords = getattr(gpu_batch, "pixel_coords", None)
+        if intrinsics is None or pixel_coords is None:
+            if not self._warned_spp_fallback:
+                rich_logger.warning(
+                    "PTIR SPP requested but batch has no pinhole intrinsics/pixel_coords; using spp=1."
+                )
+                self._warned_spp_fallback = True
+            return rays_ori, rays_dir, 1
+
+        base_batch, h, w, _ = rays_dir.shape
+        fx, fy, cx, cy = [torch.as_tensor(v, dtype=rays_dir.dtype, device=rays_dir.device) for v in intrinsics]
+        pixel_origin = pixel_coords.to(dtype=rays_dir.dtype, device=rays_dir.device) - 0.5
+        if jitter is None:
+            jitter = self._make_spp_jitter(spp, h, w, rays_dir.device, rays_dir.dtype, frame_id)
+
+        pixel_origin = pixel_origin.unsqueeze(0)
+        jitter = jitter.view(spp, 1, 1, 1, 2) if jitter.shape[1:3] == (1, 1) else jitter.view(spp, 1, h, w, 2)
+        dirs = torch.stack(
+            (
+                (pixel_origin[..., 0] + jitter[..., 0] - cx) / fx,
+                (pixel_origin[..., 1] + jitter[..., 1] - cy) / fy,
+                torch.ones((spp, base_batch, h, w), dtype=rays_dir.dtype, device=rays_dir.device),
+            ),
+            dim=-1,
+        )
+        dirs = torch.nn.functional.normalize(dirs, dim=-1).reshape(spp * base_batch, h, w, 3).contiguous()
+        origins = rays_ori.unsqueeze(0).expand(spp, *rays_ori.shape).reshape(spp * base_batch, h, w, 3).contiguous()
+        return origins, dirs, spp
+
+    @staticmethod
+    def _average_spp_output(value: torch.Tensor, spp: int, base_batch: int) -> torch.Tensor:
+        if spp == 1:
+            return value
+        return value.reshape(spp, base_batch, *value.shape[1:]).mean(dim=0)
 
     def build_acc(self, gaussians, rebuild=True):
         with torch.cuda.nvtx.range(f"build-bvh-full-build-{rebuild}"):
@@ -275,6 +388,111 @@ class Tracer:
             if self.frame_timer is not None:
                 self.frame_timer.start()
 
+            base_batch = gpu_batch.rays_dir.shape[0]
+            spp = self._get_spp(train)
+            if spp > 1 and (
+                getattr(gpu_batch, "intrinsics", None) is None or getattr(gpu_batch, "pixel_coords", None) is None
+            ):
+                if not self._warned_spp_fallback:
+                    rich_logger.warning(
+                        "PTIR SPP requested but batch has no pinhole intrinsics/pixel_coords; using spp=1."
+                    )
+                    self._warned_spp_fallback = True
+                spp = 1
+
+            spp_chunk = self._get_spp_chunk(spp)
+            h, w = gpu_batch.rays_dir.shape[1:3]
+            spp_jitter = None
+            if spp > 1:
+                spp_jitter = self._make_spp_jitter(spp, h, w, gpu_batch.rays_dir.device, gpu_batch.rays_dir.dtype, frame_id)
+            if not self._logged_spp_config:
+                num_chunks = (spp + spp_chunk - 1) // spp_chunk
+                rich_logger.warning(
+                    f"PTIR effective SPP: train={train} spp={spp} spp_chunk={spp_chunk} "
+                    f"chunks={num_chunks} base_batch={base_batch} chunk_ray_batch<={spp_chunk * base_batch} "
+                    f"resolution={w}x{h}"
+                )
+                self._logged_spp_config = True
+
+            accumulated_outputs = None
+            mog_visibility = None
+            total_spp = 0
+            for spp_start in range(0, spp, spp_chunk):
+                chunk_spp = min(spp_chunk, spp - spp_start)
+                chunk_jitter = None if spp_jitter is None else spp_jitter[spp_start : spp_start + chunk_spp]
+                rays_ori, rays_dir, chunk_spp = self._expand_rays_for_spp(
+                    gpu_batch,
+                    chunk_spp,
+                    frame_id + spp_start,
+                    jitter=chunk_jitter,
+                )
+
+                (
+                    chunk_pred_rgb,
+                    chunk_pred_opacity,
+                    chunk_pred_dist,
+                    chunk_pred_dist_second_moment,
+                    chunk_pred_distortion,
+                    chunk_pred_normals,
+                    chunk_pred_shadingnormal,
+                    chunk_pred_material,
+                    chunk_hits_count,
+                    chunk_mog_visibility,
+                ) = Tracer._Autograd.apply(
+                    self.tracer_wrapper,
+                    frame_id + spp_start,
+                    gpu_batch.T_to_world.contiguous(),
+                    rays_ori,
+                    rays_dir,
+                    gaussians.positions.contiguous(),
+                    gaussians.get_rotation().contiguous(),
+                    gaussians.get_scale().contiguous(),
+                    gaussians.get_density().contiguous(),
+                    gaussians.get_features().contiguous(),
+                    gaussians.get_shading_normal().contiguous(),
+                    gaussians.get_material_albedo().contiguous(),
+                    gaussians.get_material_roughness().contiguous(),
+                    gaussians.get_material_metallic().contiguous(),
+                    Tracer.RenderOpts.DEFAULT,
+                    gaussians.n_active_features,
+                    self.conf.render.min_transmittance,
+                    self.conf.render.get("max_bounces", 3),
+                )
+
+                chunk_pred_rgb, chunk_pred_opacity = gaussians.background(
+                    gpu_batch.T_to_world.contiguous(), rays_dir, chunk_pred_rgb, chunk_pred_opacity, train
+                )
+
+                chunk_outputs = (
+                    self._average_spp_output(chunk_pred_rgb, chunk_spp, base_batch),
+                    self._average_spp_output(chunk_pred_opacity, chunk_spp, base_batch),
+                    self._average_spp_output(chunk_pred_dist, chunk_spp, base_batch),
+                    self._average_spp_output(chunk_pred_dist_second_moment, chunk_spp, base_batch),
+                    self._average_spp_output(chunk_pred_distortion, chunk_spp, base_batch),
+                    self._average_spp_output(chunk_pred_normals, chunk_spp, base_batch),
+                    self._average_spp_output(chunk_pred_shadingnormal, chunk_spp, base_batch),
+                    self._average_spp_output(chunk_pred_material, chunk_spp, base_batch),
+                    self._average_spp_output(chunk_hits_count, chunk_spp, base_batch),
+                )
+                weighted_chunk_outputs = tuple(output * chunk_spp for output in chunk_outputs)
+                if accumulated_outputs is None:
+                    accumulated_outputs = weighted_chunk_outputs
+                else:
+                    accumulated_outputs = tuple(
+                        accumulated + weighted
+                        for accumulated, weighted in zip(accumulated_outputs, weighted_chunk_outputs)
+                    )
+
+                mog_visibility = (
+                    chunk_mog_visibility
+                    if mog_visibility is None
+                    else torch.maximum(mog_visibility, chunk_mog_visibility)
+                )
+                total_spp += chunk_spp
+
+            if self.frame_timer is not None:
+                self.frame_timer.end()
+
             (
                 pred_rgb,
                 pred_opacity,
@@ -285,32 +503,8 @@ class Tracer:
                 pred_shadingnormal,
                 pred_material,
                 hits_count,
-                mog_visibility,
-            ) = Tracer._Autograd.apply(
-                self.tracer_wrapper,
-                frame_id,
-                gpu_batch.T_to_world.contiguous(),
-                gpu_batch.rays_ori.contiguous(),
-                gpu_batch.rays_dir.contiguous(),
-                gaussians.positions.contiguous(),
-                gaussians.get_rotation().contiguous(),
-                gaussians.get_scale().contiguous(),
-                gaussians.get_density().contiguous(),
-                gaussians.get_features().contiguous(),
-                gaussians.get_shading_normal().contiguous(),
-                gaussians.get_material_albedo().contiguous(),
-                gaussians.get_material_roughness().contiguous(),
-                gaussians.get_material_metallic().contiguous(),
-                Tracer.RenderOpts.DEFAULT,
-                gaussians.n_active_features,
-                self.conf.render.min_transmittance,
-            )
-
-            if self.frame_timer is not None:
-                self.frame_timer.end()
-
-            pred_rgb, pred_opacity = gaussians.background(
-                gpu_batch.T_to_world.contiguous(), gpu_batch.rays_dir.contiguous(), pred_rgb, pred_opacity, train
+            ) = tuple(
+                accumulated / total_spp for accumulated in accumulated_outputs
             )
 
             pred_dist = pred_dist / pred_opacity

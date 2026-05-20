@@ -37,14 +37,16 @@ struct Ray {
 
 struct pathPayload {
     __device__ pathPayload()
-        : pathPayload(1u, 0u) {
+        : pathPayload(1u, 0u, 0u) {
     }
 
     __device__ pathPayload(
         const unsigned int active,
-        const unsigned int numBounces) {
+        const unsigned int numBounces,
+        const unsigned int maxBounces) {
         this->active     = active;
         this->numBounces = numBounces;
+        this->maxBounces = maxBounces;
 
         accumulatedLighting         = make_float3(0.f);
         accumulatedDirectLighting   = make_float3(0.f);
@@ -54,6 +56,7 @@ struct pathPayload {
 
     unsigned int active;
     unsigned int numBounces;
+    unsigned int maxBounces;
 
     float3 accumulatedLighting;
     float3 accumulatedDirectLighting;

@@ -14,3 +14,7 @@ max_consecutive_bvh_update: 15
 enable_normals: true
 enable_hitcounts: true
 enable_kernel_timings: false
+max_bounces: 3
+spp_chunk: 32
+forward_spp: 32
+backward_spp: 32
