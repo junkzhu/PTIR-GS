@@ -54,11 +54,11 @@ loss:
   use_ssim: true
   lambda_ssim: 0.2
 
-  use_albedo_prior_regularization: true
+  use_albedo_prior_regularization: false
   albedo_priors_end_iteration: -1
   lambda_albedo_priors_regularization: 0.02
 
-  use_roughness_prior_regularization: true
+  use_roughness_prior_regularization: false
   roughness_priors_end_iteration: -1
   lambda_roughness_priors_regularization: 0.02
 

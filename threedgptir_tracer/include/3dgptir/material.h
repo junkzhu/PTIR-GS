@@ -48,3 +48,24 @@ struct Material {
     float roughness;
     float metallic;
 };
+
+struct MaterialGrad {
+#ifdef __CUDACC__
+    __device__ MaterialGrad()
+        : MaterialGrad(make_float3(0.f, 0.f, 0.f), 0.f, 0.f) {
+    }
+
+    __device__ MaterialGrad(
+        const float3& dAlbedo,
+        const float dRoughness,
+        const float dMetallic) {
+        this->dAlbedo    = dAlbedo;
+        this->dRoughness = dRoughness;
+        this->dMetallic  = dMetallic;
+    }
+#endif
+
+    float3 dAlbedo;
+    float dRoughness;
+    float dMetallic;
+};

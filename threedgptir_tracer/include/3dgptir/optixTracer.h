@@ -104,7 +104,9 @@ protected:
         bool particleKernelDensityClamping,
         int particleRadianceSphDegree,
         bool enableNormals,
-        bool enableHitCounts);
+        bool enableHitCounts,
+        bool enableMetallic,
+        bool enableVisualizeEnvironment);
     void createPipeline(const OptixDeviceContext context,
                         const std::string& path,
                         const std::string& dependencies_path,
@@ -135,7 +137,9 @@ public:
         bool particleKernelDensityClamping,
         int particleRadianceSphDegree,
         bool enableNormals,
-        bool enableHitCounts);
+        bool enableHitCounts,
+        bool enableMetallic,
+        bool enableVisualizeEnvironment);
 
     virtual ~OptixTracer();
 
@@ -167,6 +171,7 @@ public:
         torch::Tensor rayNrm,
         torch::Tensor rayShadingNrm,
         torch::Tensor rayMaterial,
+        torch::Tensor rayPbr,
         torch::Tensor particleDensity,
         torch::Tensor particleMaterial,
         torch::Tensor particleRadiance,

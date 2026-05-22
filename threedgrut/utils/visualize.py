@@ -246,6 +246,7 @@ class TrainingVisualizer:
     def _build_pbr_material_row(self, outputs: dict) -> Optional[torch.Tensor]:
         material = self._to_material_batch(outputs.get("pred_material"))
         pbr_image = self._to_image_batch(outputs.get("pred_pbr"))
+        pbr_image_is_linear = pbr_image is not None
         if pbr_image is None:
             pbr_image = self._to_image_batch(outputs.get("pred_rgb"))
         if pbr_image is None:
@@ -259,7 +260,7 @@ class TrainingVisualizer:
                 dtype=material.dtype,
             )
         else:
-            pbr_image = pbr_image.clip(0.0, 1.0)
+            pbr_image = self._linear_to_srgb(pbr_image) if pbr_image_is_linear else pbr_image.clip(0.0, 1.0)
 
         if material is None:
             albedo_image = torch.zeros_like(pbr_image)
@@ -284,8 +285,8 @@ class TrainingVisualizer:
         if direct_image is None or indirect_image is None:
             return None
 
-        direct_image = direct_image.clip(0.0, 1.0)
-        indirect_image = indirect_image.clip(0.0, 1.0)
+        direct_image = self._linear_to_srgb(direct_image)
+        indirect_image = self._linear_to_srgb(indirect_image)
         environment_image = self._build_environment_image(
             outputs.get("environment"),
             reference=direct_image,
@@ -316,6 +317,15 @@ class TrainingVisualizer:
         if image.shape[0] != reference.shape[0]:
             image = image[:1].expand(reference.shape[0], -1, -1, -1)
         return image
+
+    @staticmethod
+    def _linear_to_srgb(image: torch.Tensor) -> torch.Tensor:
+        image = image.clip(0.0, 1.0)
+        return torch.where(
+            image <= 0.0031308,
+            12.92 * image,
+            1.055 * image ** (1.0 / 2.4) - 0.055,
+        )
 
     @staticmethod
     def _environment_to_image(environment: Optional[torch.Tensor]) -> Optional[torch.Tensor]:

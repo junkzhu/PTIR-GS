@@ -11,8 +11,10 @@ particle_radiance_sph_degree: 3
 primitive_type: instances
 min_transmittance: 0.001
 max_consecutive_bvh_update: 15
+visualize_environment: false
 enable_normals: true
 enable_hitcounts: true
+enable_metallic: ${model.optimize_material_metallic}
 enable_kernel_timings: false
 max_bounces: 3
 spp_chunk: 32

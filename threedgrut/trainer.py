@@ -744,7 +744,12 @@ class Trainer3DGRUT:
         Returns:
             losses: dictionary of loss terms computed for current batch.
         """
-        rgb_gt = gpu_batch.rgb_gt
+        rgb_gt_srgb = gpu_batch.rgb_gt
+        rgb_gt = torch.where(
+            rgb_gt_srgb <= 0.04045,
+            rgb_gt_srgb / 12.92,
+            ((rgb_gt_srgb + 0.055) / 1.055) ** 2.4,
+        )
         rgb_pred = outputs["pred_pbr"]
         mask = gpu_batch.mask
         gradient_mask = gpu_batch.gradient_mask

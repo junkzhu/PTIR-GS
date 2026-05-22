@@ -107,6 +107,14 @@ static __device__ __forceinline__ float3 compute_fast_brdf_f0(const float3& albe
     return fast_brdf_lerp(make_float3(0.04f), albedo, metallic);
 }
 
+static __device__ __forceinline__ float fast_brdf_effective_metallic(const float metallic) {
+#ifdef ENABLE_METALLIC
+    return fast_brdf_saturate(metallic);
+#else
+    return 0.0f;
+#endif
+}
+
 static __device__ __forceinline__ float3 compute_fast_brdf_fresnel_schlick(const float cosTheta, const float3& f0) {
     const float x  = 1.0f - fast_brdf_saturate(cosTheta);
     const float x2 = x * x;
@@ -201,6 +209,140 @@ static __device__ __forceinline__ float3 sample_fast_brdf(
     return fast_brdf_clamp_nonnegative(outFactor * 2.0f);
 }
 
+struct FastBrdfValueGrad {
+    float3 value;
+    float3 dBrdf_dAlbedo;
+    float3 dBrdf_dMetallic;
+    float3 dBrdf_dRoughness;
+};
+
+static __device__ __forceinline__ float fast_brdf_nonnegative_grad_mask(const float v) {
+#ifdef FAST_BRDF_GUARD_NAN
+    return (fast_brdf_is_finite(v) && v > 0.0f) ? 1.0f : 0.0f;
+#else
+    return (v > 0.0f) ? 1.0f : 0.0f;
+#endif
+}
+
+static __device__ __forceinline__ float3 fast_brdf_nonnegative_grad_mask(const float3& v) {
+    return make_float3(
+        fast_brdf_nonnegative_grad_mask(v.x),
+        fast_brdf_nonnegative_grad_mask(v.y),
+        fast_brdf_nonnegative_grad_mask(v.z));
+}
+
+static __device__ __forceinline__ FastBrdfValueGrad sample_fast_brdf_with_grads(
+    const float3& wo,
+    const float3& normal,
+    const float3& albedo,
+    const float metallic,
+    const float roughness,
+    const float3& rand,
+    float3& nextRayDirection) {
+    const float rough = fast_brdf_clamp_roughness(roughness);
+    const float3 f0   = compute_fast_brdf_f0(albedo, metallic);
+
+    float3 outFactor         = make_float3(0.0f);
+    float3 dOut_dAlbedo      = make_float3(0.0f);
+    float3 dOut_dRoughness   = make_float3(0.0f);
+#ifdef ENABLE_METALLIC
+    float3 dOut_dMetallic    = make_float3(0.0f);
+#endif
+    float3 L                 = normal;
+
+    if (rand.z < 0.5f) {
+        L = sample_fast_brdf_diffuse_direction(normal, rand.x, rand.y);
+        const float3 H = fast_brdf_safe_normalize(wo + L, normal);
+
+        const float cosTheta  = fast_brdf_positive_dot(wo, H);
+        const float x         = 1.0f - fast_brdf_saturate(cosTheta);
+        const float x2        = x * x;
+        const float q         = x2 * x2 * x;
+        const float oneMinusQ = 1.0f - q;
+
+        const float3 F = f0 + (make_float3(1.0f) - f0) * q;
+
+        const float dF_dAlbedo = oneMinusQ * metallic;
+#ifdef ENABLE_METALLIC
+        const float3 dF_dMetallic = (albedo - make_float3(0.04f)) * oneMinusQ;
+#endif
+
+        const float3 oneMinusF   = make_float3(1.0f) - F;
+        const float oneMinusMetallic = 1.0f - metallic;
+        const float3 diffuseColor = albedo * oneMinusMetallic;
+        outFactor                 = diffuseColor * oneMinusF;
+
+        dOut_dAlbedo   = oneMinusMetallic * (oneMinusF - albedo * dF_dAlbedo);
+#ifdef ENABLE_METALLIC
+        dOut_dMetallic = -albedo * oneMinusF - albedo * oneMinusMetallic * dF_dMetallic;
+#endif
+    } else {
+        const float3 H = sample_fast_brdf_ggx_half_vector(normal, rough, rand.x, rand.y);
+        const float rawVdotH = dot(wo, H);
+        L                   = 2.0f * rawVdotH * H - wo;
+
+        const float NdotV = fast_brdf_positive_dot(normal, wo);
+        const float NdotL = fast_brdf_positive_dot(normal, L);
+        const float NdotH = fast_brdf_positive_dot(normal, H);
+        const float VdotH = fast_brdf_positive_dot(wo, H);
+
+        const float x         = 1.0f - fast_brdf_saturate(VdotH);
+        const float x2        = x * x;
+        const float q         = x2 * x2 * x;
+        const float oneMinusQ = 1.0f - q;
+
+        const float3 F = f0 + (make_float3(1.0f) - f0) * q;
+
+        const float dF_dAlbedo = oneMinusQ * metallic;
+#ifdef ENABLE_METALLIC
+        const float3 dF_dMetallic = (albedo - make_float3(0.04f)) * oneMinusQ;
+#endif
+
+        const float k  = 0.5f * rough * rough;
+        const float Dv = fmaxf(NdotV * (1.0f - k) + k, FastBrdfEps);
+        const float Dl = fmaxf(NdotL * (1.0f - k) + k, FastBrdfEps);
+        const float Gv = NdotV / Dv;
+        const float Gl = NdotL / Dl;
+        const float G  = Gv * Gl;
+
+        const float denom = fmaxf(NdotH * NdotV, 1e-3f);
+        const float S     = G * VdotH / denom;
+
+        outFactor       = F * S;
+        dOut_dAlbedo    = make_float3(S * dF_dAlbedo);
+#ifdef ENABLE_METALLIC
+        dOut_dMetallic  = dF_dMetallic * S;
+#endif
+
+        const float dGv_dk = -NdotV * (1.0f - NdotV) / (Dv * Dv);
+        const float dGl_dk = -NdotL * (1.0f - NdotL) / (Dl * Dl);
+        const float dG_dk  = Gl * dGv_dk + Gv * dGl_dk;
+
+        const float drough_dinput = (roughness > FastBrdfMinRough && roughness < 1.0f) ? 1.0f : 0.0f;
+        const float dk_droughness = rough * drough_dinput;
+        const float dS_dRoughness = VdotH / denom * dG_dk * dk_droughness;
+        dOut_dRoughness           = F * dS_dRoughness;
+    }
+
+    nextRayDirection = L;
+    if (dot(normal, nextRayDirection) <= 0.0f) {
+        nextRayDirection = normal;
+    }
+
+    const float3 valueMask = fast_brdf_nonnegative_grad_mask(outFactor);
+
+    FastBrdfValueGrad result;
+    result.value                = fast_brdf_clamp_nonnegative(outFactor * 2.0f);
+    result.dBrdf_dAlbedo        = dOut_dAlbedo * 2.0f * valueMask;
+    result.dBrdf_dRoughness     = dOut_dRoughness * 2.0f * valueMask;
+#ifdef ENABLE_METALLIC
+    result.dBrdf_dMetallic      = dOut_dMetallic * 2.0f * valueMask;
+#else
+    result.dBrdf_dMetallic      = make_float3(0.0f);
+#endif
+    return result;
+}
+
 static __device__ __forceinline__ float3 sampled_fast_brdf(
     const float3& rayDirection,
     Sampler& sampler,
@@ -211,10 +353,26 @@ static __device__ __forceinline__ float3 sampled_fast_brdf(
     const float3 wo     = fast_brdf_safe_normalize(-rayDirection, normal);
 
     const float3 albedo = fast_brdf_saturate(interaction.material.albedo);
-    const float metallic = fast_brdf_saturate(interaction.material.metallic);
+    const float metallic = fast_brdf_effective_metallic(interaction.material.metallic);
     const float roughness = fast_brdf_clamp_roughness(interaction.material.roughness);
 
     return sample_fast_brdf(wo, normal, albedo, metallic, roughness, sampler.next_3d(), nextRayDirection);
+}
+
+static __device__ __forceinline__ FastBrdfValueGrad sampled_fast_brdf_with_grads(
+    const float3& rayDirection,
+    Sampler& sampler,
+    const Interaction& interaction,
+    float3& nextRayDirection) {
+    const float3 normalFallback = make_float3(0.0f, 0.0f, 1.0f);
+    const float3 normal = fast_brdf_safe_normalize(interaction.shadingnormal, normalFallback);
+    const float3 wo     = fast_brdf_safe_normalize(-rayDirection, normal);
+
+    const float3 albedo = fast_brdf_saturate(interaction.material.albedo);
+    const float metallic = fast_brdf_effective_metallic(interaction.material.metallic);
+    const float roughness = interaction.material.roughness;
+
+    return sample_fast_brdf_with_grads(wo, normal, albedo, metallic, roughness, sampler.next_3d(), nextRayDirection);
 }
 
 #endif

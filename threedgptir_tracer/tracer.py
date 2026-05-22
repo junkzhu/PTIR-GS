@@ -115,6 +115,7 @@ class Tracer:
                 ray_normals,
                 ray_shadingnormal,
                 ray_material,
+                ray_pbr,
                 particle_density,
                 particle_material,
                 mog_sph,
@@ -170,6 +171,7 @@ class Tracer:
                 ray_normals,
                 ray_shadingnormal,
                 ray_material,
+                ray_pbr,
                 particle_density,
                 particle_material,
                 mog_sph,
@@ -190,6 +192,7 @@ class Tracer:
                 ray_normals,
                 ray_shadingnormal,
                 ray_material,
+                ray_pbr,
                 particle_density,
                 particle_material,
                 mog_sph,
@@ -300,6 +303,8 @@ class Tracer:
             self.conf.render.particle_radiance_sph_degree,
             self.conf.render.enable_normals,
             self.conf.render.enable_hitcounts,
+            self.conf.render.get("enable_metallic", self.conf.model.get("optimize_material_metallic", False)),
+            self.conf.render.get("visualize_environment", False),
         )
 
         self.frame_timer = CudaTimer() if self.conf.render.enable_kernel_timings else None

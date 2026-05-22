@@ -189,63 +189,25 @@ static __device__ __inline__ void rayIntersect(
 template <typename PipelineParams>
 static __device__ __inline__ void rayIntersectBwd(
     const Ray& ray,
-    const uint3& idx,
+    const float rayOpacity,
+    const float rayMaxHitDistance,
+    const MaterialGrad& materialGrad,
     const PipelineParams& pipelineParams) {
-    const float3 rayIntegratedRadiance = make_float3(
-        pipelineParams.rayRadiance[idx.z][idx.y][idx.x][0],
-        pipelineParams.rayRadiance[idx.z][idx.y][idx.x][1],
-        pipelineParams.rayRadiance[idx.z][idx.y][idx.x][2]);
-    const float rayIntegratedTransmittance = 1.0f - pipelineParams.rayDensity[idx.z][idx.y][idx.x][0];
-    const float rayIntegratedHitDistance   = pipelineParams.rayHitDistance[idx.z][idx.y][idx.x][0];
-    const float rayIntegratedHitDistanceSecondMoment = pipelineParams.rayHitDistanceSecondMoment[idx.z][idx.y][idx.x][0];
-    const float rayIntegratedDepthDistortion = pipelineParams.rayDepthDistortion[idx.z][idx.y][idx.x][0];
-    const float rayMaxHitDistance = pipelineParams.rayHitDistance[idx.z][idx.y][idx.x][1];
-    const float3 rayIntegratedShadingNormal = make_float3(
-        pipelineParams.rayShadingNormal[idx.z][idx.y][idx.x][0],
-        pipelineParams.rayShadingNormal[idx.z][idx.y][idx.x][1],
-        pipelineParams.rayShadingNormal[idx.z][idx.y][idx.x][2]);
-    const Material rayIntegratedMaterial(
-        make_float3(
-            pipelineParams.rayMaterial[idx.z][idx.y][idx.x][0],
-            pipelineParams.rayMaterial[idx.z][idx.y][idx.x][1],
-            pipelineParams.rayMaterial[idx.z][idx.y][idx.x][2]),
-        pipelineParams.rayMaterial[idx.z][idx.y][idx.x][3],
-        pipelineParams.rayMaterial[idx.z][idx.y][idx.x][4]);
-
-    const float3 rayRadianceGrad = make_float3(
-        pipelineParams.rayRadianceGrad[idx.z][idx.y][idx.x][0],
-        pipelineParams.rayRadianceGrad[idx.z][idx.y][idx.x][1],
-        pipelineParams.rayRadianceGrad[idx.z][idx.y][idx.x][2]);
-    const float rayTransmittanceGrad = -1.0f * pipelineParams.rayDensityGrad[idx.z][idx.y][idx.x][0];
-    const float rayHitDistanceGrad   = pipelineParams.rayHitDistanceGrad[idx.z][idx.y][idx.x][0];
-    const float rayHitDistanceSecondMomentGrad = pipelineParams.rayHitDistanceSecondMomentGrad[idx.z][idx.y][idx.x][0];
-    const float rayDepthDistortionGrad = rayIntegratedDepthDistortion > 0.0f ? pipelineParams.rayDepthDistortionGrad[idx.z][idx.y][idx.x][0] : 0.0f;
-    const float3 rayShadingNormalGrad = make_float3(
-        pipelineParams.rayShadingNormalGrad[idx.z][idx.y][idx.x][0],
-        pipelineParams.rayShadingNormalGrad[idx.z][idx.y][idx.x][1],
-        pipelineParams.rayShadingNormalGrad[idx.z][idx.y][idx.x][2]);
+    const float invRayOpacity = 1.0f / fmaxf(rayOpacity, 1e-12f);
     const Material rayMaterialGrad(
-        make_float3(
-            pipelineParams.rayMaterialGrad[idx.z][idx.y][idx.x][0],
-            pipelineParams.rayMaterialGrad[idx.z][idx.y][idx.x][1],
-            pipelineParams.rayMaterialGrad[idx.z][idx.y][idx.x][2]),
-        pipelineParams.rayMaterialGrad[idx.z][idx.y][idx.x][3],
-        pipelineParams.rayMaterialGrad[idx.z][idx.y][idx.x][4]);
+        materialGrad.dAlbedo * invRayOpacity,
+        materialGrad.dRoughness * invRayOpacity,
+        materialGrad.dMetallic * invRayOpacity);
 
     constexpr float epsT = 1e-9;
     const float2 minMaxT = intersectAABB(pipelineParams.aabb, ray);
     float startT         = fmaxf(0.0f, minMaxT.x - epsT);
     const float endT     = fminf(rayMaxHitDistance, minMaxT.y) + epsT;
 
-    float3 rayRadiance = make_float3(0.f);
     float rayTransmittance = 1.f;
-    float rayHitDistance = 0.f;
-    float rayHitDistanceSecondMoment = 0.f;
-    float3 rayShadingNormal = make_float3(0.f);
-    Material rayMaterial;
     RayPayload hitPayload;
 
-    while (startT < endT) {
+    while ((startT < endT) && (rayTransmittance > pipelineParams.minTransmittance)) {
         trace(hitPayload, ray, startT + epsT, endT);
         if (hitPayload[0].particleId == RayHit::InvalidParticleId) {
             break;
@@ -255,66 +217,52 @@ static __device__ __inline__ void rayIntersectBwd(
         for (int i = 0; i < PipelineParameters::MaxNumHitPerTrace; i++) {
             const RayHit rayHit = hitPayload[i];
 
-            if (rayHit.particleId != RayHit::InvalidParticleId) {
-                processHitBwd<PipelineParameters::ParticleKernelDegree, PipelineParameters::SurfelPrimitive>(
-                    ray.origin,
-                    ray.direction,
+            if ((rayHit.particleId != RayHit::InvalidParticleId) && (rayTransmittance > pipelineParams.minTransmittance)) {
+                float3 particlePosition;
+                float3 particleScale;
+                float33 particleRotation;
+                float particleDensity;
+                fetchParticleDensity(
                     rayHit.particleId,
                     pipelineParams.particleDensity,
-                    pipelineParams.particleDensityGrad,
-                    pipelineParams.particleMaterial,
-                    pipelineParams.particleMaterialGrad,
-                    pipelineParams.particleRadiance,
-                    pipelineParams.particleRadianceGrad,
-                    pipelineParams.particleShadingNormal,
-                    pipelineParams.particleShadingNormalGrad,
-                    pipelineParams.hitMinGaussianResponse,
-                    pipelineParams.alphaMinThreshold,
-                    pipelineParams.minTransmittance,
-                    pipelineParams.sphDegree,
-                    rayIntegratedTransmittance,
-                    rayTransmittance,
-                    rayTransmittanceGrad,
-                    rayIntegratedRadiance,
-                    rayRadiance,
-                    rayRadianceGrad,
-                    rayIntegratedHitDistance,
-                    rayHitDistance,
-                    rayHitDistanceGrad,
-                    rayIntegratedHitDistanceSecondMoment,
-                    rayHitDistanceSecondMoment,
-                    rayHitDistanceSecondMomentGrad,
-                    rayDepthDistortionGrad,
-                    rayIntegratedShadingNormal,
-                    rayShadingNormal,
-                    rayShadingNormalGrad,
-                    rayIntegratedMaterial,
-                    rayMaterial,
-                    rayMaterialGrad);
+                    particlePosition,
+                    particleScale,
+                    particleRotation,
+                    particleDensity);
 
+                const float3 giscl   = make_float3(1.0f / particleScale.x, 1.0f / particleScale.y, 1.0f / particleScale.z);
+                const float3 gposc   = ray.origin - particlePosition;
+                const float3 gposcr  = gposc * particleRotation;
+                const float3 gro     = giscl * gposcr;
+                const float3 rayDirR = ray.direction * particleRotation;
+                const float3 grdu    = giscl * rayDirR;
+                const float3 grd     = safe_normalize(grdu);
+                const float3 gcrod   = PipelineParameters::SurfelPrimitive ? gro + grd * -gro.z / grd.z : cross(grd, gro);
+                const float grayDist = dot(gcrod, gcrod);
+
+                const float gres   = particleResponse<PipelineParameters::ParticleKernelDegree>(grayDist);
+                const float galpha = fminf(0.99f, gres * particleDensity);
+                if ((gres > pipelineParams.hitMinGaussianResponse) && (galpha > pipelineParams.alphaMinThreshold)) {
+                    const float weight = galpha * rayTransmittance;
+                    Material& particleMaterialGrad = pipelineParams.particleMaterialGrad[rayHit.particleId];
+                    atomicAdd(&particleMaterialGrad.albedo.x, weight * rayMaterialGrad.albedo.x);
+                    atomicAdd(&particleMaterialGrad.albedo.y, weight * rayMaterialGrad.albedo.y);
+                    atomicAdd(&particleMaterialGrad.albedo.z, weight * rayMaterialGrad.albedo.z);
+                    atomicAdd(&particleMaterialGrad.roughness, weight * rayMaterialGrad.roughness);
+#ifdef ENABLE_METALLIC
+                    atomicAdd(&particleMaterialGrad.metallic, weight * rayMaterialGrad.metallic);
+#endif
+                    rayTransmittance *= (1.0f - galpha);
+                }
                 startT = fmaxf(startT, rayHit.distance);
             }
         }
     }
 }
 
-// selfOcclusionRejection(Ray& ray, Sampler){
-//     if (dot(rayDirection, rayDirection) <=1e-6f)
-//     {
-//         return
-//     }
-
-//     float3 origin = ray.origin;
-//     float accumulatedOffset = 0.0f;
-//     for (int step = 0; step < 8; ++step) {
-//         const float remainingOffset = kMaxSelfOcclusionOffset - accumulatedOffset;
-//         if (remainingOffset <= 0.0f) {
-//             break;
-//         }
-
-//     }
-// }
-
+static __device__ __inline__ void selfOcclusionRejection(Ray& ray) {
+    ray.origin = ray.origin + kMaxSelfOcclusionOffset * ray.direction;
+}
 
 static __device__ __inline__ void sampleBrdfNextDirection(
     pathPayload& path,
@@ -330,9 +278,52 @@ static __device__ __inline__ void sampleBrdfNextDirection(
         nextRayDirection);
 
     path.pathThroughput *= brdf;
-    path.currentRayPayload = rayPayload(Ray(currentInteraction.position, nextRayDirection), 0.0f);
+    Ray nextRay(currentInteraction.position, nextRayDirection);
+    selfOcclusionRejection(nextRay);
+    path.currentRayPayload = rayPayload(nextRay, 0.0f);
 }
 
+
+template <typename PipelineParams>
+static __device__ __inline__ void sampleBrdfNextDirectionBwd(
+    pathPayload& path,
+    Sampler& sampler,
+    const PipelineParams& pipelineParams) {
+    const Ray currentRay = path.currentRayPayload.ray;
+    const Interaction currentInteraction = path.currentRayPayload.interaction;
+
+    float3 nextRayDirection = currentRay.direction;
+    const FastBrdfValueGrad brdf = sampled_fast_brdf_with_grads(
+        currentRay.direction,
+        sampler,
+        currentInteraction,
+        nextRayDirection);
+
+    const float3 dLoss_dBrdfNumerator = path.accumulatedLightingGrad * path.accumulatedLighting;
+    const float3 dLoss_dBrdf = make_float3(
+        brdf.value.x > FastBrdfEps ? dLoss_dBrdfNumerator.x / brdf.value.x : 0.0f,
+        brdf.value.y > FastBrdfEps ? dLoss_dBrdfNumerator.y / brdf.value.y : 0.0f,
+        brdf.value.z > FastBrdfEps ? dLoss_dBrdfNumerator.z / brdf.value.z : 0.0f);
+    path.currentRayPayload.interaction.materialGrad.dAlbedo = dLoss_dBrdf * brdf.dBrdf_dAlbedo;
+    path.currentRayPayload.interaction.materialGrad.dRoughness = dot(dLoss_dBrdf, brdf.dBrdf_dRoughness);
+#ifdef ENABLE_METALLIC
+    path.currentRayPayload.interaction.materialGrad.dMetallic = dot(dLoss_dBrdf, brdf.dBrdf_dMetallic);
+#else
+    path.currentRayPayload.interaction.materialGrad.dMetallic = 0.0f;
+#endif
+
+    rayIntersectBwd(
+        currentRay,
+        1.0f - path.currentRayPayload.transmittance,
+        path.currentRayPayload.lastHitDistance,
+        path.currentRayPayload.interaction.materialGrad,
+        pipelineParams);
+
+    path.pathThroughput *= brdf.value;
+    Ray nextRay(currentInteraction.position, nextRayDirection);
+    selfOcclusionRejection(nextRay);
+    path.currentRayPayload = rayPayload(nextRay, 0.0f);
+}
 
 static __device__ __inline__ void writePrimaryRayOutputs(
     const uint3& idx,

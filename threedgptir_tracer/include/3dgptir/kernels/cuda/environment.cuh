@@ -81,6 +81,33 @@ static __device__ __forceinline__ float4 sampleEnvironmentBilinear(const Environ
         footprint.w00 * c00.w + footprint.w10 * c10.w + footprint.w01 * c01.w + footprint.w11 * c11.w);
 }
 
+template <typename PipelineParams>
+static __device__ __forceinline__ void accumulateEnvironmentTexelGrad(
+    PipelineParams& pipelineParams,
+    const int x,
+    const int y,
+    const float weight,
+    const float3& colorGrad) {
+    atomicAdd(&pipelineParams.environmentGrad[y][x][0], weight * colorGrad.x);
+    atomicAdd(&pipelineParams.environmentGrad[y][x][1], weight * colorGrad.y);
+    atomicAdd(&pipelineParams.environmentGrad[y][x][2], weight * colorGrad.z);
+}
+
+template <typename PipelineParams>
+static __device__ __forceinline__ float3 sampleEnvironmentBilinearBwd(
+    const EnvironmentBilinearFootprint& footprint,
+    const float3& colorGrad,
+    PipelineParams& pipelineParams) {
+    const float4 env = sampleEnvironmentBilinear(footprint);
+
+    accumulateEnvironmentTexelGrad(pipelineParams, footprint.x0, footprint.y0, footprint.w00, colorGrad);
+    accumulateEnvironmentTexelGrad(pipelineParams, footprint.x1, footprint.y0, footprint.w10, colorGrad);
+    accumulateEnvironmentTexelGrad(pipelineParams, footprint.x0, footprint.y1, footprint.w01, colorGrad);
+    accumulateEnvironmentTexelGrad(pipelineParams, footprint.x1, footprint.y1, footprint.w11, colorGrad);
+
+    return make_float3(env.x, env.y, env.z);
+}
+
 static __device__ __forceinline__ float3 rotateEnvironmentDirection(const float3& rayDir) {
     const float rotZ = params.environment.offset.x * 2.0f * CUDART_PI_F + 0.5f * CUDART_PI_F;
     const float rotX = params.environment.offset.y * 2.0f * CUDART_PI_F;
@@ -191,6 +218,30 @@ static __device__ __forceinline__ float3 getBackgroundColorCubemap(const float3&
     return make_float3(env.x, env.y, env.z);
 }
 
+template <typename PipelineParams>
+static __device__ __forceinline__ float3 getBackgroundColorEquirectBwd(
+    const float3& dir,
+    const float3& colorGrad,
+    PipelineParams& pipelineParams) {
+    const float theta = atan2f(dir.x, dir.y);
+    const float zcl   = fminf(1.0f, fmaxf(-1.0f, -dir.z));
+    const float phi   = asinf(zcl);
+    const float u     = (theta + CUDART_PI_F) * (0.5f * (1.0f / CUDART_PI_F));
+    const float v     = 0.5f + phi * (1.0f / CUDART_PI_F);
+    return sampleEnvironmentBilinearBwd(computeEnvironmentBilinearFootprint(u, v), colorGrad, pipelineParams);
+}
+
+template <typename PipelineParams>
+static __device__ __forceinline__ float3 getBackgroundColorCubemapBwd(
+    const float3& dir,
+    const float3& colorGrad,
+    PipelineParams& pipelineParams) {
+    int face;
+    float u, v;
+    dirToCubemapFaceUV(dir, face, u, v);
+    return sampleEnvironmentBilinearBwd(computeCubemapBilinearFootprint(face, u, v), colorGrad, pipelineParams);
+}
+
 static __device__ __forceinline__ float3 getBackgroundColor(const float3 rayDir) {
     if (params.environment.data == nullptr || params.environment.width <= 0 || params.environment.height <= 0) {
         return make_float3(0.0f);
@@ -201,6 +252,22 @@ static __device__ __forceinline__ float3 getBackgroundColor(const float3 rayDir)
         return getBackgroundColorCubemap(dir);
     }
     return getBackgroundColorEquirect(dir);
+}
+
+template <typename PipelineParams>
+static __device__ __forceinline__ float3 getBackgroundColorBwd(
+    const float3 rayDir,
+    const float3& colorGrad,
+    PipelineParams& pipelineParams) {
+    if (params.environment.data == nullptr || params.environment.width <= 0 || params.environment.height <= 0) {
+        return make_float3(0.0f);
+    }
+
+    const float3 dir = rotateEnvironmentDirection(rayDir);
+    if (params.environment.type == EnvironmentType_Cube) {
+        return getBackgroundColorCubemapBwd(dir, colorGrad, pipelineParams);
+    }
+    return getBackgroundColorEquirectBwd(dir, colorGrad, pipelineParams);
 }
 
 static __device__ __forceinline__ void accumulateLightContribution(pathPayload& path) {
@@ -220,5 +287,23 @@ static __device__ __forceinline__ void accumulateLightContribution(pathPayload& 
         }
     }
 }
+
+template <typename PipelineParams>
+static __device__ __forceinline__ void accumulateLightContributionBwd(
+    pathPayload& path,
+    PipelineParams& pipelineParams) {
+    path.currentRayPayload.contribution = make_float3(0.0f);
+    const bool hasEnvironment = params.environment.data != nullptr && params.environment.width > 0 && params.environment.height > 0;
+    if (path.currentRayPayload.valid && hasEnvironment) {
+        path.pathThroughput *= path.currentRayPayload.transmittance;
+
+        const float3 environmentGrad = path.accumulatedLightingGrad * path.pathThroughput;
+        const float3 background = getBackgroundColorBwd(path.currentRayPayload.ray.direction, environmentGrad, pipelineParams);
+        path.currentRayPayload.contribution = path.pathThroughput * background;
+        path.currentRayPayload.radiance += path.currentRayPayload.contribution;
+        path.accumulatedLighting -= path.currentRayPayload.contribution;
+    }
+}
+
 
 #endif // __CUDACC__

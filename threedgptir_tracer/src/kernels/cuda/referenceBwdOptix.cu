@@ -35,8 +35,26 @@ extern "C" __global__ void __raygen__rg() {
     sampler.initFromLaunch(idx, params.frameNumber);
 
     pathPayload path(1u, 0u, params.maxBounces);
-    
-    rayIntersectBwd(ray, idx, params);
+    path.accumulatedLighting = make_float3(params.rayPbr[idx.z][idx.y][idx.x][0], params.rayPbr[idx.z][idx.y][idx.x][1], params.rayPbr[idx.z][idx.y][idx.x][2]);
+    path.accumulatedLightingGrad = make_float3(params.rayPbrGrad[idx.z][idx.y][idx.x][0], params.rayPbrGrad[idx.z][idx.y][idx.x][1], params.rayPbrGrad[idx.z][idx.y][idx.x][2]);
+
+    rayIntersect(ray, path.currentRayPayload, sampler);
+#ifndef ENABLE_VISUALIZE_ENVIRONMENT
+    if (!path.currentRayPayload.interaction.valid) { return; }
+#endif
+
+    for (unsigned int depth = 0; depth < params.maxBounces && path.active; ++depth) {
+        accumulateLightContributionBwd(path, params);
+
+        path.active &= (depth + 1u < path.maxBounces) && path.currentRayPayload.interaction.valid;
+        if (!path.active) { break; }
+        path.numBounces = depth + 1u;
+
+        sampleBrdfNextDirectionBwd(path, sampler, params);
+        const float throughputMax = fmaxf(path.pathThroughput.x, fmaxf(path.pathThroughput.y, path.pathThroughput.z));
+        if (throughputMax < 1e-4f) { break; }
+        rayIntersect(path.currentRayPayload.ray, path.currentRayPayload, sampler);
+    }
 }
 
 extern "C" __global__ void __intersection__is() {

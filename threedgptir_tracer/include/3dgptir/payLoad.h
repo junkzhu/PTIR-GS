@@ -92,6 +92,7 @@ struct pathPayload {
         this->maxBounces = maxBounces;
 
         accumulatedLighting         = make_float3(0.f);
+        accumulatedLightingGrad     = make_float3(0.f);
         accumulatedDirectLighting   = make_float3(0.f);
         accumulatedIndirectLighting = make_float3(0.f);
         pathThroughput              = make_float3(1.f);
@@ -104,6 +105,7 @@ struct pathPayload {
     rayPayload currentRayPayload;
 
     float3 accumulatedLighting;
+    float3 accumulatedLightingGrad;
     float3 accumulatedDirectLighting;
     float3 accumulatedIndirectLighting;
     float3 pathThroughput;

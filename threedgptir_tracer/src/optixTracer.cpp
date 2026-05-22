@@ -218,7 +218,9 @@ std::vector<std::string> OptixTracer::generateDefines(
     bool particleKernelDensityClamping,
     int particleRadianceSphDegree,
     bool enableNormals,
-    bool enableHitCounts) {
+    bool enableHitCounts,
+    bool enableMetallic,
+    bool enableVisualizeEnvironment) {
     std::vector<std::string> defines;
     if (_state) {
         defines.emplace_back("-DPARTICLE_KERNEL_DEGREE=" + std::to_string(static_cast<int32_t>(particleKernelDegree)));
@@ -227,6 +229,12 @@ std::vector<std::string> OptixTracer::generateDefines(
         }
         if (enableHitCounts) {
             defines.emplace_back("-DENABLE_HIT_COUNTS");
+        }
+        if (enableMetallic) {
+            defines.emplace_back("-DENABLE_METALLIC");
+        }
+        if (enableVisualizeEnvironment) {
+            defines.emplace_back("-DENABLE_VISUALIZE_ENVIRONMENT");
         }
         defines.emplace_back("-DSPH_MAX_NUM_COEFFS=" + std::to_string((_state->particleRadianceSphDegree + 1) * (_state->particleRadianceSphDegree + 1)));
         defines.emplace_back("-DPARTICLE_PRIMITIVE_TYPE=" + std::to_string(_state->gPrimType));
@@ -246,7 +254,9 @@ OptixTracer::OptixTracer(
     bool particleKernelDensityClamping,
     int particleRadianceSphDegree,
     bool enableNormals,
-    bool enableHitCounts) {
+    bool enableHitCounts,
+    bool enableMetallic,
+    bool enableVisualizeEnvironment) {
 
     _state = new State();
     memset(_state, 0, sizeof(State));
@@ -282,7 +292,7 @@ OptixTracer::OptixTracer(
     _state->gPrimNumTri                   = 0;
 
     std::vector<std::string> defines = generateDefines(particleKernelDegree, particleKernelDensityClamping,
-                                                       particleRadianceSphDegree, enableNormals, enableHitCounts);
+                                                       particleRadianceSphDegree, enableNormals, enableHitCounts, enableMetallic, enableVisualizeEnvironment);
 
     const uint32_t sharedFlags =
         (_state->gPrimType == MOGTracingSphere ? PipelineFlag_SpherePrim : ((_state->gPrimType == MOGTracingCustom) || (_state->gPrimType == MOGTracingInstances) ? PipelineFlag_HasIS : 0));
@@ -965,6 +975,7 @@ OptixTracer::traceBwd(uint32_t frameNumber,
                       torch::Tensor rayNrm,
                       torch::Tensor rayShadingNrm,
                       torch::Tensor rayMaterial,
+                      torch::Tensor rayPbr,
                       torch::Tensor particleDensity,
                       torch::Tensor particleMaterial,
                       torch::Tensor particleRadiance,
@@ -989,6 +1000,7 @@ OptixTracer::traceBwd(uint32_t frameNumber,
     torch::Tensor particleMaterialGrad  = torch::zeros({particleMaterial.size(0), particleMaterial.size(1)}, opts);
     torch::Tensor particleRadianceGrad = torch::zeros({particleRadiance.size(0), particleRadiance.size(1)}, opts);
     torch::Tensor particleShadingNormalGrad = torch::zeros({particleShadingNormal.size(0), particleShadingNormal.size(1)}, opts);
+    torch::Tensor particleVisibility = torch::zeros({particleDensity.size(0), 1}, opts);
     torch::Tensor environmentGrad = torch::zeros_like(environment);
 
     PipelineBackwardParameters paramsHost;
@@ -1015,6 +1027,7 @@ OptixTracer::traceBwd(uint32_t frameNumber,
     paramsHost.particleRadiance     = getPtr<const float>(particleRadiance);
     paramsHost.particleShadingNormal = getPtr<const float>(particleShadingNormal);
     paramsHost.particleExtendedData = reinterpret_cast<const void*>(_state->gPipelineParticleData);
+    paramsHost.particleVisibility   = getPtr<int32_t>(particleVisibility);
 
     paramsHost.rayRadiance    = packed_accessor32<float, 4>(rayRad);
     paramsHost.rayDensity     = packed_accessor32<float, 4>(rayDns);
@@ -1024,6 +1037,7 @@ OptixTracer::traceBwd(uint32_t frameNumber,
     paramsHost.rayNormal      = packed_accessor32<float, 4>(rayNrm);
     paramsHost.rayShadingNormal = packed_accessor32<float, 4>(rayShadingNrm);
     paramsHost.rayMaterial    = packed_accessor32<float, 4>(rayMaterial);
+    paramsHost.rayPbr         = packed_accessor32<float, 4>(rayPbr);
 
     paramsHost.particleDensityGrad  = getPtr<ParticleDensity>(particleDensityGrad);
     paramsHost.particleMaterialGrad = getPtr<Material>(particleMaterialGrad);

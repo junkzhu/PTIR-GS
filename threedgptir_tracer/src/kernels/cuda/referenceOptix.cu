@@ -39,22 +39,26 @@ extern "C" __global__ void __raygen__rg() {
     rayIntersect(ray, path.currentRayPayload, sampler);
     writePrimaryRayOutputs(idx, path.currentRayPayload);
 
+#ifndef ENABLE_VISUALIZE_ENVIRONMENT
+    if (!path.currentRayPayload.interaction.valid) {
+        return;
+    }
+#endif
+
     for (unsigned int depth = 0; depth < params.maxBounces && path.active; ++depth) {
         accumulateLightContribution(path);
 
-        const unsigned int nextDepth = depth + 1u;
-        path.active &= (nextDepth < path.maxBounces) && path.currentRayPayload.interaction.valid;
+        path.active &= (depth + 1u < path.maxBounces) && path.currentRayPayload.interaction.valid;
         if (!path.active) {
             break;
         }
-        path.numBounces = nextDepth;
+        path.numBounces = depth + 1u;
 
         sampleBrdfNextDirection(path, sampler);
         const float throughputMax = fmaxf(path.pathThroughput.x, fmaxf(path.pathThroughput.y, path.pathThroughput.z));
         if (throughputMax < 1e-4f) {
             break;
         }
-        path.currentRayPayload.ray.origin = path.currentRayPayload.ray.origin + 0.1 * path.currentRayPayload.ray.direction;
         rayIntersect(path.currentRayPayload.ray, path.currentRayPayload, sampler);
     }
 

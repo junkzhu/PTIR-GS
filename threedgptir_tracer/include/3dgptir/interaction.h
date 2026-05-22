@@ -41,6 +41,7 @@ struct Interaction {
         this->position      = position;
         this->shadingnormal = shadingnormal;
         this->material      = material;
+        this->materialGrad  = MaterialGrad();
     }
 
     __device__ Interaction(
@@ -62,7 +63,8 @@ struct Interaction {
             integratedShadingnormal.x * invOpacity,
             integratedShadingnormal.y * invOpacity,
             integratedShadingnormal.z * invOpacity);
-        material = Material(integratedMaterial, invOpacity);
+        material     = Material(integratedMaterial, invOpacity);
+        materialGrad = MaterialGrad();
     }
 #endif
 
@@ -70,4 +72,5 @@ struct Interaction {
     float3 position;
     float3 shadingnormal;
     Material material;
+    MaterialGrad materialGrad;
 };
