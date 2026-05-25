@@ -48,6 +48,8 @@ class Environment:
     This is the lightweight model-side version of the playground environment
     helper. It intentionally does not do tonemapping; loaded HDR/EXR values are
     kept linear and only padded with an alpha channel for CUDA texture upload.
+    When optimization is enabled, ``self.environment`` stores log-radiance
+    parameters and ``get_environment()`` returns the exp-activated radiance.
     """
 
     FIXED_ENVIRONMENT_OPTIONS = ["Model-Background", "Black", "White"]
@@ -62,8 +64,11 @@ class Environment:
         ("+z", "posz", "pz", "front"),
         ("-z", "negz", "nz", "back"),
     )
-    DEFAULT_ENVIRONMENT_SIZE = (12, 24)
+    DEFAULT_ENVIRONMENT_SIZE = (64, 128)
     DEFAULT_CUBEMAP_FACE_SIZE = 64
+    LOG_ENVIRONMENT_MIN = 1.0e-6
+    LOG_ENVIRONMENT_PARAMETERIZATION = "log_exp"
+    LINEAR_ENVIRONMENT_PARAMETERIZATION = "linear"
 
     def __init__(
         self,
@@ -89,15 +94,35 @@ class Environment:
         else:
             self.load_path(path)
 
+    @classmethod
+    def _actual_to_internal(cls, environment: torch.Tensor) -> torch.Tensor:
+        return torch.log(torch.clamp(environment, min=cls.LOG_ENVIRONMENT_MIN))
+
+    @staticmethod
+    def _internal_to_actual(environment: torch.Tensor) -> torch.Tensor:
+        return torch.exp(environment)
+
+    def _as_environment_tensor(self, environment: torch.Tensor) -> torch.Tensor:
+        tensor = torch.as_tensor(environment, dtype=torch.float32, device=self.device).contiguous()
+        if tensor.dim() != 3 or tensor.size(-1) != 4:
+            raise ValueError(f"environment must have shape [H, W, 4], got {tuple(tensor.shape)}")
+        return tensor
+
+    def _set_environment_parameter(self, environment: torch.Tensor) -> None:
+        tensor = self._as_environment_tensor(environment)
+        if self.optimize_environment:
+            self.environment = torch.nn.Parameter(tensor.detach().clone(), requires_grad=True)
+        else:
+            self.environment = self._internal_to_actual(tensor).detach()
+
     def _set_environment_tensor(self, environment: Optional[torch.Tensor]) -> None:
         if environment is None:
             self.environment = None
             return
 
-        tensor = torch.as_tensor(environment, dtype=torch.float32, device=self.device).contiguous()
-        if tensor.dim() != 3 or tensor.size(-1) != 4:
-            raise ValueError(f"environment must have shape [H, W, 4], got {tuple(tensor.shape)}")
+        tensor = self._as_environment_tensor(environment)
         if self.optimize_environment:
+            tensor = self._actual_to_internal(tensor)
             self.environment = torch.nn.Parameter(tensor.detach().clone(), requires_grad=True)
         else:
             self.environment = tensor.detach()
@@ -229,7 +254,7 @@ class Environment:
         self.current_name = "Cubemap-Faces"
         self._hdr_data = self._prepare_cubemap(np.stack(faces, axis=0))
         self._update()
-        return self.environment
+        return self.get_environment()
 
     def load_path(self, environment_path: str) -> torch.Tensor:
         """Load an environment map from an explicit file path."""
@@ -249,7 +274,7 @@ class Environment:
         self.current_name = os.path.basename(environment_path)
         self._hdr_data = self._prepare_environment_data(self._read_environment_file(environment_path))
         self._update()
-        return self.environment
+        return self.get_environment()
 
     def load_file(self, environment_path: str) -> torch.Tensor:
         return self.load_path(environment_path)
@@ -271,7 +296,7 @@ class Environment:
                 self._hdr_data = self._prepare_environment_data(self._read_environment_file(environment_path))
                 self._update()
 
-        return self.environment
+        return self.get_environment()
 
     def _constant_environment(self, value: float) -> torch.Tensor:
         if self.environment_type == "cube":
@@ -279,15 +304,17 @@ class Environment:
             width = self.DEFAULT_CUBEMAP_FACE_SIZE
         else:
             height, width = self.DEFAULT_ENVIRONMENT_SIZE
-        return torch.full([height, width, 4], value, dtype=torch.float32, device=self.device)
+        environment = torch.full([height, width, 4], value, dtype=torch.float32, device=self.device)
+        environment[..., 3] = 1.0
+        return environment
 
-    def init_environment(self, value: float = 1.0) -> torch.Tensor:
+    def init_environment(self, value: float = 1.5) -> torch.Tensor:
         self.path = None
         self.folder = None
         self.current_name = "Initialized"
         self._hdr_data = None
         self._set_environment_tensor(self._constant_environment(value))
-        return self.environment
+        return self.get_environment()
 
     def set_env(self, env_name: Optional[str] = None) -> None:
         if env_name in ("Model-Background", "Black"):
@@ -307,7 +334,14 @@ class Environment:
         pad = environment.new_ones(environment.shape[0], environment.shape[1], 1)
         self._set_environment_tensor(torch.cat([environment, pad], dim=-1))
 
+    def get_environment_parameter(self) -> Optional[torch.Tensor]:
+        return self.environment
+
     def get_environment(self) -> Optional[torch.Tensor]:
+        if self.environment is None:
+            return None
+        if self.optimize_environment:
+            return self._internal_to_actual(self.environment)
         return self.environment
 
     def get_environment_offset(self) -> torch.Tensor:
@@ -322,6 +356,11 @@ class Environment:
             "path": self.path,
             "environment_offset": list(self.environment_offset),
             "environment": None if self.environment is None else self.environment.detach().clone(),
+            "environment_parameterization": (
+                self.LOG_ENVIRONMENT_PARAMETERIZATION
+                if self.optimize_environment
+                else self.LINEAR_ENVIRONMENT_PARAMETERIZATION
+            ),
             "environment_type": self.environment_type,
             "optimize_environment": self.optimize_environment,
         }
@@ -335,5 +374,13 @@ class Environment:
         )
         self.optimize_environment = bool(state_dict.get("optimize_environment", self.optimize_environment))
         environment = state_dict.get("environment")
-        self._set_environment_tensor(environment)
+        parameterization = state_dict.get("environment_parameterization", self.LINEAR_ENVIRONMENT_PARAMETERIZATION)
+        if environment is None:
+            self.environment = None
+        elif parameterization == self.LOG_ENVIRONMENT_PARAMETERIZATION:
+            self._set_environment_parameter(environment)
+        elif parameterization == self.LINEAR_ENVIRONMENT_PARAMETERIZATION:
+            self._set_environment_tensor(environment)
+        else:
+            raise ValueError(f"Unknown environment parameterization '{parameterization}'.")
         self._hdr_data = None

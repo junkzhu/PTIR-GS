@@ -219,7 +219,7 @@ class Trainer3DGRUT:
             optimize_environment=optimize_environment,
         )
         self.model.optimize_environment = self.environment.optimize_environment
-        self.model.environment = self.environment.get_environment()
+        self.model.environment = self.environment.get_environment_parameter()
 
     def restore_environment_from_checkpoint(self, checkpoint: dict, conf: DictConfig) -> None:
         environment_state = checkpoint.get("environment_state")
@@ -229,7 +229,7 @@ class Trainer3DGRUT:
         self.environment.load_state_dict(environment_state)
         self.environment.configure_optimization(bool(OmegaConf.select(conf, "model.optimize_environment", default=False)))
         self.model.optimize_environment = self.environment.optimize_environment
-        self.model.environment = self.environment.get_environment()
+        self.model.environment = self.environment.get_environment_parameter()
 
     def init_densification_and_pruning_strategy(self, conf: DictConfig) -> None:
         """Set pre-train / post-train iteration logic. i.e. densification and pruning"""

@@ -91,6 +91,8 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         return self.material_metallic_activation(self.material_metallic)
 
     def get_environment(self) -> torch.Tensor | None:
+        if self.environment is not None and self.optimize_environment:
+            return torch.exp(self.environment)
         return self.environment
 
     def get_shading_normal(self, preactivation=False) -> torch.Tensor:
@@ -577,6 +579,28 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             self.set_optimizable_parameters()
         self.validate_fields()
 
+    def _checkpoint_parameter_or_default(
+        self,
+        checkpoint: dict,
+        name: str,
+        expected_shape: tuple[int, ...],
+        default_factory,
+    ) -> torch.nn.Parameter:
+        value = checkpoint.get(name)
+        if value is None:
+            return default_factory()
+
+        if tuple(value.shape) != expected_shape:
+            logger.warning(
+                f"Ignoring checkpoint field '{name}' with shape {tuple(value.shape)}; "
+                f"expected {expected_shape}."
+            )
+            return default_factory()
+
+        if isinstance(value, torch.nn.Parameter):
+            return value
+        return torch.nn.Parameter(value)
+
     def init_from_checkpoint(self, checkpoint: dict, setup_optimizer=True):
         self.positions = checkpoint["positions"]
         self.rotation = checkpoint["rotation"]
@@ -584,34 +608,30 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.density = checkpoint["density"]
         self.features_albedo = checkpoint["features_albedo"]
         self.features_specular = checkpoint["features_specular"]
-        self.shading_normal = checkpoint.get(
+        num_gaussians = self.positions.shape[0]
+        self.shading_normal = self._checkpoint_parameter_or_default(
+            checkpoint,
             "shading_normal",
-            torch.nn.Parameter(
-                self._default_shading_normal(
-                    self.rotation,
-                )
-            ),
+            (num_gaussians, 3),
+            lambda: torch.nn.Parameter(self._default_shading_normal(self.rotation)),
         )
-        self.material_albedo = checkpoint.get(
+        self.material_albedo = self._checkpoint_parameter_or_default(
+            checkpoint,
             "material_albedo",
-            self._default_material_albedo(
-                self.positions.shape[0],
-                self.positions.dtype
-            ),
+            (num_gaussians, 3),
+            lambda: self._default_material_albedo(num_gaussians, self.positions.dtype),
         )
-        self.material_roughness = checkpoint.get(
+        self.material_roughness = self._checkpoint_parameter_or_default(
+            checkpoint,
             "material_roughness",
-            self._default_material_roughness(
-                self.positions.shape[0],
-                self.positions.dtype,
-            ),
+            (num_gaussians, 1),
+            lambda: self._default_material_roughness(num_gaussians, self.positions.dtype),
         )
-        self.material_metallic = checkpoint.get(
+        self.material_metallic = self._checkpoint_parameter_or_default(
+            checkpoint,
             "material_metallic",
-            self._default_material_metallic(
-                self.positions.shape[0],
-                self.positions.dtype,
-            ),
+            (num_gaussians, 1),
+            lambda: self._default_material_metallic(num_gaussians, self.positions.dtype),
         )
         self.n_active_features = checkpoint["n_active_features"]
         self.max_n_features = checkpoint["max_n_features"]
