@@ -18,6 +18,5 @@ enable_metallic: ${model.optimize_material_metallic}
 enable_kernel_timings: false
 max_bounces: 3
 spp_chunk: 32
-forward_spp: 32
-backward_spp: 32
+inversion_spp: 32
 render_spp: 128

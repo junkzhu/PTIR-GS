@@ -39,6 +39,15 @@ extern "C" __global__ void __raygen__rg() {
     path.accumulatedLightingGrad = make_float3(params.rayPbrGrad[idx.z][idx.y][idx.x][0], params.rayPbrGrad[idx.z][idx.y][idx.x][1], params.rayPbrGrad[idx.z][idx.y][idx.x][2]);
 
     rayIntersect<false>(ray, path.currentRayPayload, sampler);
+
+    if (path.currentRayPayload.interaction.valid) {
+        path.currentRayPayload.interaction.materialGrad.dAlbedo += make_float3(params.rayMaterialGrad[idx.z][idx.y][idx.x][0], params.rayMaterialGrad[idx.z][idx.y][idx.x][1], params.rayMaterialGrad[idx.z][idx.y][idx.x][2]);
+        path.currentRayPayload.interaction.materialGrad.dRoughness += params.rayMaterialGrad[idx.z][idx.y][idx.x][3];
+#ifdef ENABLE_METALLIC
+        path.currentRayPayload.interaction.materialGrad.dMetallic += params.rayMaterialGrad[idx.z][idx.y][idx.x][4];
+#endif
+    }
+    
 #ifndef ENABLE_VISUALIZE_ENVIRONMENT
     if (!path.currentRayPayload.interaction.valid) { return; }
 #endif

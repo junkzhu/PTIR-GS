@@ -313,7 +313,7 @@ class Tracer:
 
     def _get_spp(self, train: bool) -> int:
         if train:
-            spp = self.conf.render.backward_spp
+            spp = self.conf.render.inversion_spp
         else:
             spp = self.conf.render.render_spp
         return max(1, int(spp))

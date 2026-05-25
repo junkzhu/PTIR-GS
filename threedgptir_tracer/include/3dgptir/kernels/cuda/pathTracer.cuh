@@ -326,12 +326,10 @@ static __device__ __inline__ void sampleBrdfNextDirectionBwd(
         brdf.value.x > FastBrdfEps ? dLoss_dBrdfNumerator.x / brdf.value.x : 0.0f,
         brdf.value.y > FastBrdfEps ? dLoss_dBrdfNumerator.y / brdf.value.y : 0.0f,
         brdf.value.z > FastBrdfEps ? dLoss_dBrdfNumerator.z / brdf.value.z : 0.0f);
-    path.currentRayPayload.interaction.materialGrad.dAlbedo = dLoss_dBrdf * brdf.dBrdf_dAlbedo;
-    path.currentRayPayload.interaction.materialGrad.dRoughness = dot(dLoss_dBrdf, brdf.dBrdf_dRoughness);
+    path.currentRayPayload.interaction.materialGrad.dAlbedo += dLoss_dBrdf * brdf.dBrdf_dAlbedo;
+    path.currentRayPayload.interaction.materialGrad.dRoughness += dot(dLoss_dBrdf, brdf.dBrdf_dRoughness);
 #ifdef ENABLE_METALLIC
-    path.currentRayPayload.interaction.materialGrad.dMetallic = dot(dLoss_dBrdf, brdf.dBrdf_dMetallic);
-#else
-    path.currentRayPayload.interaction.materialGrad.dMetallic = 0.0f;
+    path.currentRayPayload.interaction.materialGrad.dMetallic += dot(dLoss_dBrdf, brdf.dBrdf_dMetallic);
 #endif
 
     if (path.numBounces > 1u) {
