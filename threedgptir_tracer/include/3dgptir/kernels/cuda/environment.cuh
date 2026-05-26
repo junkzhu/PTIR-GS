@@ -10,6 +10,8 @@
 #include <3dgptir/payLoad.h>
 #include <math_constants.h>
 
+static constexpr float EnvironmentDirectionGradEps = 1e-3f;
+
 static __device__ __forceinline__ int environmentClampInt(int value, int lo, int hi) {
     return max(lo, min(value, hi));
 }
@@ -108,19 +110,48 @@ static __device__ __forceinline__ float3 sampleEnvironmentBilinearBwd(
     return make_float3(env.x, env.y, env.z);
 }
 
-static __device__ __forceinline__ float3 rotateEnvironmentDirection(const float3& rayDir) {
+struct EnvironmentRotation {
+    float sinZ;
+    float cosZ;
+    float sinX;
+    float cosX;
+};
+
+static __device__ __forceinline__ EnvironmentRotation computeEnvironmentRotation() {
     const float rotZ = params.environment.offset.x * 2.0f * CUDART_PI_F + 0.5f * CUDART_PI_F;
     const float rotX = params.environment.offset.y * 2.0f * CUDART_PI_F;
 
+    EnvironmentRotation rotation;
+    sincosf(rotZ, &rotation.sinZ, &rotation.cosZ);
+    sincosf(rotX, &rotation.sinX, &rotation.cosX);
+    return rotation;
+}
+
+static __device__ __forceinline__ float3 rotateEnvironmentDirectionWithRotation(
+    const float3& rayDir,
+    const EnvironmentRotation& rotation) {
     const float3 rotatedDir = make_float3(
-        rayDir.x * cosf(rotZ) - rayDir.y * sinf(rotZ),
-        rayDir.x * sinf(rotZ) + rayDir.y * cosf(rotZ),
+        rayDir.x * rotation.cosZ - rayDir.y * rotation.sinZ,
+        rayDir.x * rotation.sinZ + rayDir.y * rotation.cosZ,
         rayDir.z);
 
     return make_float3(
         rotatedDir.x,
-        rotatedDir.y * cosf(rotX) - rotatedDir.z * sinf(rotX),
-        rotatedDir.y * sinf(rotX) + rotatedDir.z * cosf(rotX));
+        rotatedDir.y * rotation.cosX - rotatedDir.z * rotation.sinX,
+        rotatedDir.y * rotation.sinX + rotatedDir.z * rotation.cosX);
+}
+
+static __device__ __forceinline__ float3 rotateEnvironmentDirection(const float3& rayDir) {
+    const EnvironmentRotation rotation = computeEnvironmentRotation();
+    const float3 rotatedDir = make_float3(
+        rayDir.x * rotation.cosZ - rayDir.y * rotation.sinZ,
+        rayDir.x * rotation.sinZ + rayDir.y * rotation.cosZ,
+        rayDir.z);
+
+    return make_float3(
+        rotatedDir.x,
+        rotatedDir.y * rotation.cosX - rotatedDir.z * rotation.sinX,
+        rotatedDir.y * rotation.sinX + rotatedDir.z * rotation.cosX);
 }
 
 static __device__ __forceinline__ void dirToCubemapFaceUV(const float3& dir, int& face, float& u, float& v) {
@@ -242,12 +273,7 @@ static __device__ __forceinline__ float3 getBackgroundColorCubemapBwd(
     return sampleEnvironmentBilinearBwd(computeCubemapBilinearFootprint(face, u, v), colorGrad, pipelineParams);
 }
 
-static __device__ __forceinline__ float3 getBackgroundColor(const float3 rayDir) {
-    if (params.environment.data == nullptr || params.environment.width <= 0 || params.environment.height <= 0) {
-        return make_float3(0.0f);
-    }
-
-    const float3 dir = rotateEnvironmentDirection(rayDir);
+static __device__ __forceinline__ float3 sampleBackgroundColorRotatedDirection(const float3& dir) {
     if (params.environment.type == EnvironmentType_Cube) {
         return getBackgroundColorCubemap(dir);
     }
@@ -255,19 +281,68 @@ static __device__ __forceinline__ float3 getBackgroundColor(const float3 rayDir)
 }
 
 template <typename PipelineParams>
-static __device__ __forceinline__ float3 getBackgroundColorBwd(
-    const float3 rayDir,
+static __device__ __forceinline__ float3 sampleBackgroundColorRotatedDirectionBwd(
+    const float3& dir,
     const float3& colorGrad,
     PipelineParams& pipelineParams) {
+    if (params.environment.type == EnvironmentType_Cube) {
+        return getBackgroundColorCubemapBwd(dir, colorGrad, pipelineParams);
+    }
+    return getBackgroundColorEquirectBwd(dir, colorGrad, pipelineParams);
+}
+
+static __device__ __forceinline__ float3 getBackgroundRayDirectionGradFast(
+    const float3& rayDir,
+    const float3& background,
+    const float3& colorGrad,
+    const EnvironmentRotation& rotation) {
+    const float3 unitRayDir = safe_normalize(rayDir);
+
+    float3 tangent;
+    float3 bitangent;
+    branchlessONB(unitRayDir, tangent, bitangent);
+
+    const float perturbScale = rsqrtf(1.0f + EnvironmentDirectionGradEps * EnvironmentDirectionGradEps);
+    const float3 tangentRayDir   = (unitRayDir + EnvironmentDirectionGradEps * tangent) * perturbScale;
+    const float3 bitangentRayDir = (unitRayDir + EnvironmentDirectionGradEps * bitangent) * perturbScale;
+
+    const float3 tangentBackground =
+        sampleBackgroundColorRotatedDirection(rotateEnvironmentDirectionWithRotation(tangentRayDir, rotation));
+    const float3 bitangentBackground =
+        sampleBackgroundColorRotatedDirection(rotateEnvironmentDirectionWithRotation(bitangentRayDir, rotation));
+
+    const float invEps = 1.0f / EnvironmentDirectionGradEps;
+    const float tangentGrad = dot((tangentBackground - background) * invEps, colorGrad);
+    const float bitangentGrad = dot((bitangentBackground - background) * invEps, colorGrad);
+    return tangent * tangentGrad + bitangent * bitangentGrad;
+}
+
+static __device__ __forceinline__ float3 getBackgroundColor(const float3 rayDir) {
     if (params.environment.data == nullptr || params.environment.width <= 0 || params.environment.height <= 0) {
         return make_float3(0.0f);
     }
 
     const float3 dir = rotateEnvironmentDirection(rayDir);
-    if (params.environment.type == EnvironmentType_Cube) {
-        return getBackgroundColorCubemapBwd(dir, colorGrad, pipelineParams);
+    return sampleBackgroundColorRotatedDirection(dir);
+}
+
+template <typename PipelineParams>
+static __device__ __forceinline__ float3 getBackgroundColorBwd(
+    const float3 rayDir,
+    const float3& colorGrad,
+    PipelineParams& pipelineParams,
+    float3* rayDirGrad = nullptr) {
+    if (params.environment.data == nullptr || params.environment.width <= 0 || params.environment.height <= 0) {
+        return make_float3(0.0f);
     }
-    return getBackgroundColorEquirectBwd(dir, colorGrad, pipelineParams);
+
+    const EnvironmentRotation rotation = computeEnvironmentRotation();
+    const float3 dir = rotateEnvironmentDirectionWithRotation(rayDir, rotation);
+    const float3 background = sampleBackgroundColorRotatedDirectionBwd(dir, colorGrad, pipelineParams);
+    if (rayDirGrad != nullptr) {
+        *rayDirGrad += getBackgroundRayDirectionGradFast(rayDir, background, colorGrad, rotation);
+    }
+    return background;
 }
 
 static __device__ __forceinline__ void accumulateLightContribution(pathPayload& path) {
@@ -315,7 +390,7 @@ static __device__ __forceinline__ void accumulateLightContributionBwd(
         } else if (path.currentRayPayload.valid && hasEnvironment) {
             path.pathThroughput *= path.currentRayPayload.transmittance;
             const float3 environmentGrad = path.accumulatedLightingGrad * path.pathThroughput;
-            const float3 background = getBackgroundColorBwd(path.currentRayPayload.ray.direction, environmentGrad, pipelineParams);
+            const float3 background = getBackgroundColorBwd(path.currentRayPayload.ray.direction, environmentGrad, pipelineParams, &path.currentRayPayload.rayDirGrad);
             path.currentRayPayload.contribution = path.pathThroughput * background;
             path.accumulatedLighting -= path.currentRayPayload.contribution;
         }
@@ -326,7 +401,7 @@ static __device__ __forceinline__ void accumulateLightContributionBwd(
         path.pathThroughput *= path.currentRayPayload.transmittance;
 
         const float3 environmentGrad = path.accumulatedLightingGrad * path.pathThroughput;
-        const float3 background = getBackgroundColorBwd(path.currentRayPayload.ray.direction, environmentGrad, pipelineParams);
+        const float3 background = getBackgroundColorBwd(path.currentRayPayload.ray.direction, environmentGrad, pipelineParams, &path.currentRayPayload.rayDirGrad);
         path.currentRayPayload.contribution = path.pathThroughput * background;
         path.currentRayPayload.radiance += path.currentRayPayload.contribution;
         path.accumulatedLighting -= path.currentRayPayload.contribution;

@@ -293,8 +293,20 @@ class NeRFDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             albedo_path = self.material_albedo_paths[idx]
             roughness_path = self.material_roughness_paths[idx]
             if os.path.exists(albedo_path) and os.path.exists(roughness_path):
-                albedo = NeRFDataset.__read_linear_image(albedo_path, self.img_wh, num_channels=3)
-                roughness = NeRFDataset.__read_linear_image(roughness_path, self.img_wh, num_channels=1)
+                is_synthetic4relight = "synthetic4relight" in os.path.normpath(self.root_dir).lower()
+                albedo = NeRFDataset.__read_linear_image(
+                    albedo_path,
+                    self.img_wh,
+                    num_channels=3,
+                    srgb_to_linear=is_synthetic4relight,
+                    apply_alpha=is_synthetic4relight,
+                )
+                roughness = NeRFDataset.__read_linear_image(
+                    roughness_path,
+                    self.img_wh,
+                    num_channels=1,
+                    apply_alpha=is_synthetic4relight,
+                )
 
                 output_dict["material_albedo"] = torch.from_numpy(albedo).reshape(out_shape)
                 output_dict["material_roughness"] = torch.from_numpy(roughness).reshape(1, self.image_h, self.image_w, 1)
@@ -622,21 +634,34 @@ class NeRFDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             return img
 
     @staticmethod
-    def __read_linear_image(img_path, img_wh, num_channels):
+    def __read_linear_image(img_path, img_wh, num_channels, srgb_to_linear=False, apply_alpha=False):
         img = imageio.imread(img_path)
         if img.ndim == 2:
             img = img[..., None]
         if img.ndim != 3:
             raise ValueError(f"Expected image with shape [H, W, C] for {img_path}, got {img.shape}")
-        if img.shape[2] == 4:
-            img = img[..., :3]
 
         if np.issubdtype(img.dtype, np.integer):
             img = img.astype(np.float32) / float(np.iinfo(img.dtype).max)
         else:
             img = img.astype(np.float32)
 
+        alpha = None
+        if img.shape[2] == 4:
+            alpha = img[..., 3:4]
+            img = img[..., :3]
+
+        if srgb_to_linear:
+            img = np.clip(img, 0.0, 1.0)
+            img = np.where(img <= 0.04045, img / 12.92, ((img + 0.055) / 1.055) ** 2.4)
+
         img = cv2.resize(img, img_wh)
+        if alpha is not None:
+            alpha = cv2.resize(alpha, img_wh)
+            if alpha.ndim == 2:
+                alpha = alpha[..., None]
+            if apply_alpha:
+                img = img * alpha
         if img.ndim == 2:
             img = img[..., None]
 

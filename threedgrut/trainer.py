@@ -833,6 +833,15 @@ class Trainer3DGRUT:
                     )
                     lambda_roughness_priors_regularization = self.conf.loss.lambda_roughness_priors_regularization
 
+        # Roughness high regularization
+        loss_roughness_high_regularization = torch.zeros(1, device=self.device)
+        lambda_roughness_high_regularization = 0.0
+        if self.conf.loss.get("use_roughness_high_regularization", False) and pred_material is not None:
+            with torch.cuda.nvtx.range(f"loss-roughness-high-regularization"):
+                pred_roughness = pred_material[..., 3:4]
+                loss_roughness_high_regularization = 1.0 - pred_roughness.mean()
+                lambda_roughness_high_regularization = self.conf.loss.lambda_roughness_high_regularization
+
         # Edge aware smoothness loss
         loss_edge_aware_smoothness = torch.zeros(1, device=self.device)
         lambda_edge_aware_smoothness = 0.0
@@ -869,6 +878,7 @@ class Trainer3DGRUT:
             + lambda_ssim * loss_ssim
             + lambda_albedo_priors_regularization * loss_albedo_priors_regularization
             + lambda_roughness_priors_regularization * loss_roughness_priors_regularization
+            + lambda_roughness_high_regularization * loss_roughness_high_regularization
             + lambda_edge_aware_smoothness * loss_edge_aware_smoothness
         )
         return dict(
@@ -878,6 +888,7 @@ class Trainer3DGRUT:
             ssim_loss=lambda_ssim * loss_ssim,
             albedo_priors_regularization_loss=lambda_albedo_priors_regularization * loss_albedo_priors_regularization,
             roughness_priors_regularization_loss=lambda_roughness_priors_regularization * loss_roughness_priors_regularization,
+            roughness_high_regularization_loss=lambda_roughness_high_regularization * loss_roughness_high_regularization,
             edge_aware_smoothness_loss=lambda_edge_aware_smoothness * loss_edge_aware_smoothness,
         )
 
@@ -1052,6 +1063,18 @@ class Trainer3DGRUT:
                 writer.add_scalar(
                     "loss/roughness_priors_regularization/train",
                     roughness_priors_regularization_loss,
+                    global_step,
+                )
+            if (
+                self.conf.loss.get("use_roughness_high_regularization", False)
+                and "roughness_high_regularization_loss" in batch_metrics["losses"]
+            ):
+                roughness_high_regularization_loss = np.mean(
+                    batch_metrics["losses"]["roughness_high_regularization_loss"]
+                )
+                writer.add_scalar(
+                    "loss/roughness_high_regularization/train",
+                    roughness_high_regularization_loss,
                     global_step,
                 )
             if self.conf.loss.use_edge_aware_smoothness:

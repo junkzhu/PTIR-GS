@@ -287,6 +287,44 @@ static __device__ __inline__ void rayIntersectBwd(
     }
 }
 
+template <typename PipelineParams>
+static __device__ __inline__ void PendingRayDirectionGradBwd(
+    pathPayload& path,
+    const PipelineParams& pipelineParams) {
+    PendingRayDirectionGrad& pending = path.pendingRayDirectionGrad;
+    if (!pending.valid) {
+        return;
+    }
+
+    const float dRoughness = dot(path.currentRayPayload.rayDirGrad, pending.dNextDirDRoughness);
+    const Ray pendingRay = pending.ray;
+    const float pendingOpacity = pending.opacity;
+    const float pendingMaxHitDistance = pending.maxHitDistance;
+    const unsigned int pendingNumBounces = pending.numBounces;
+    path.pendingRayDirectionGrad.clear();
+    if (dRoughness == 0.0f) {
+        return;
+    }
+
+    MaterialGrad materialGrad;
+    materialGrad.dRoughness = dRoughness;
+    if (pendingNumBounces > 1u) {
+        rayIntersectBwd<true>(
+            pendingRay,
+            pendingOpacity,
+            pendingMaxHitDistance,
+            materialGrad,
+            pipelineParams);
+    } else {
+        rayIntersectBwd<false>(
+            pendingRay,
+            pendingOpacity,
+            pendingMaxHitDistance,
+            materialGrad,
+            pipelineParams);
+    }
+}
+
 static __device__ __inline__ void sampleBrdfNextDirection(
     pathPayload& path,
     Sampler& sampler) {
@@ -331,6 +369,13 @@ static __device__ __inline__ void sampleBrdfNextDirectionBwd(
 #ifdef ENABLE_METALLIC
     path.currentRayPayload.interaction.materialGrad.dMetallic += dot(dLoss_dBrdf, brdf.dBrdf_dMetallic);
 #endif
+
+    path.pendingRayDirectionGrad.set(
+        currentRay,
+        1.0f - path.currentRayPayload.transmittance,
+        path.currentRayPayload.lastHitDistance,
+        brdf.dNextDir_dRoughness,
+        path.numBounces);
 
     if (path.numBounces > 1u) {
         rayIntersectBwd<true>(

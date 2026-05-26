@@ -5,7 +5,7 @@ defaults:
   - /base_gs
   - _self_
 
-n_iterations: 1500
+n_iterations: 1000
 visualize_frequency: 20
 sh_indirect_iterations: 100
 
@@ -24,13 +24,13 @@ environment:
 optimizer:
   params:
     material_albedo:
-      lr: 0.02
+      lr: 0.025
     material_roughness:
-      lr: 0.02
+      lr: 0.025
     material_metallic:
       lr: 0.0
     environment:
-      lr: 0.02
+      lr: 0.01
 
 strategy:
   densify:
@@ -56,12 +56,15 @@ loss:
   lambda_ssim: 0.2
 
   use_albedo_prior_regularization: false
-  albedo_priors_end_iteration: -1
+  albedo_priors_end_iteration: 200
   lambda_albedo_priors_regularization: 0.02
 
   use_roughness_prior_regularization: false
-  roughness_priors_end_iteration: -1
+  roughness_priors_end_iteration: 200
   lambda_roughness_priors_regularization: 0.02
+
+  use_roughness_high_regularization: false
+  lambda_roughness_high_regularization: 0.0001
 
   use_edge_aware_smoothness: true
   lambda_edge_aware_smoothness: 0.02

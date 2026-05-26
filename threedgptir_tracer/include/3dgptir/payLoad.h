@@ -56,6 +56,7 @@ struct rayPayload {
         lastHitDistance          = initialLastHitDistance;
         depthDistortion          = 0.f;
         hitsCount                = 0.f;
+        rayDirGrad               = make_float3(0.f);
         hit                      = 0;
         valid                    = false;
     }
@@ -74,8 +75,50 @@ struct rayPayload {
     float depthDistortion;
     float hitsCount;
 
+    float3 rayDirGrad;
+
     unsigned int hit;
     bool valid;
+};
+
+struct PendingRayDirectionGrad {
+    __device__ PendingRayDirectionGrad() {
+        clear();
+    }
+
+    __device__ void clear() {
+        valid = false;
+        ray = Ray();
+        opacity = 0.f;
+        maxHitDistance = 0.f;
+        dNextDirDRoughness = make_float3(0.f);
+        numBounces = 0u;
+    }
+
+    __device__ void set(
+        const Ray& pendingRay,
+        const float pendingOpacity,
+        const float pendingMaxHitDistance,
+        const float3& pendingDNextDirDRoughness,
+        const unsigned int pendingNumBounces) {
+        const float gradLength2 =
+            pendingDNextDirDRoughness.x * pendingDNextDirDRoughness.x +
+            pendingDNextDirDRoughness.y * pendingDNextDirDRoughness.y +
+            pendingDNextDirDRoughness.z * pendingDNextDirDRoughness.z;
+        valid = gradLength2 > 0.0f;
+        ray = pendingRay;
+        opacity = pendingOpacity;
+        maxHitDistance = pendingMaxHitDistance;
+        dNextDirDRoughness = pendingDNextDirDRoughness;
+        numBounces = pendingNumBounces;
+    }
+
+    bool valid;
+    Ray ray;
+    float opacity;
+    float maxHitDistance;
+    float3 dNextDirDRoughness;
+    unsigned int numBounces;
 };
 
 struct pathPayload {
@@ -109,4 +152,6 @@ struct pathPayload {
     float3 accumulatedDirectLighting;
     float3 accumulatedIndirectLighting;
     float3 pathThroughput;
+
+    PendingRayDirectionGrad pendingRayDirectionGrad;
 };

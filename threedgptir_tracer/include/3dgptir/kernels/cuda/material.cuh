@@ -26,6 +26,7 @@
 static constexpr float FastBrdfEps      = 1e-6f;
 static constexpr float FastBrdfMinRough = 0.05f;
 static constexpr float FastBrdfPi2      = 6.28318530717958647692f;
+static constexpr float FastBrdfRoughnessGradEps = 1e-3f;
 
 #ifdef FAST_BRDF_GUARD_NAN
 static constexpr float FastBrdfMaxValue = 1e20f;
@@ -160,7 +161,7 @@ static __device__ __forceinline__ float3 sample_fast_brdf_ggx_half_vector(
     return compute_fast_brdf_normal_space(normal, localH);
 }
 
-static __device__ __forceinline__ float3 sample_fast_brdf(
+static __device__ __forceinline__ float3 eval_fast_brdf_sample_value(
     const float3& wo,
     const float3& normal,
     const float3& albedo,
@@ -185,6 +186,7 @@ static __device__ __forceinline__ float3 sample_fast_brdf(
         const float3 H = sample_fast_brdf_ggx_half_vector(normal, rough, rand.x, rand.y);
         const float rawVdotH = dot(wo, H);
         L                   = 2.0f * rawVdotH * H - wo;
+        const bool validNextDirection = dot(normal, L) > 0.0f;
 
         const float NdotV = fast_brdf_positive_dot(normal, wo);
         const float NdotL = fast_brdf_positive_dot(normal, L);
@@ -199,6 +201,10 @@ static __device__ __forceinline__ float3 sample_fast_brdf(
         const float G  = Gv * Gl;
 
         outFactor = F * (G * VdotH / fmaxf(NdotH * NdotV, 1e-3f));
+        if (!validNextDirection) {
+            outFactor = make_float3(0.0f);
+            L         = normal;
+        }
     }
 
     nextRayDirection = L;
@@ -209,11 +215,23 @@ static __device__ __forceinline__ float3 sample_fast_brdf(
     return fast_brdf_clamp_nonnegative(outFactor * 2.0f);
 }
 
+static __device__ __forceinline__ float3 sample_fast_brdf(
+    const float3& wo,
+    const float3& normal,
+    const float3& albedo,
+    const float metallic,
+    const float roughness,
+    const float3& rand,
+    float3& nextRayDirection) {
+    return eval_fast_brdf_sample_value(wo, normal, albedo, metallic, roughness, rand, nextRayDirection);
+}
+
 struct FastBrdfValueGrad {
     float3 value;
     float3 dBrdf_dAlbedo;
     float3 dBrdf_dMetallic;
     float3 dBrdf_dRoughness;
+    float3 dNextDir_dRoughness;
 };
 
 static __device__ __forceinline__ float fast_brdf_nonnegative_grad_mask(const float v) {
@@ -245,6 +263,7 @@ static __device__ __forceinline__ FastBrdfValueGrad sample_fast_brdf_with_grads(
     float3 outFactor         = make_float3(0.0f);
     float3 dOut_dAlbedo      = make_float3(0.0f);
     float3 dOut_dRoughness   = make_float3(0.0f);
+    float3 dNextDir_dRoughness  = make_float3(0.0f);
 #ifdef ENABLE_METALLIC
     float3 dOut_dMetallic    = make_float3(0.0f);
 #endif
@@ -280,6 +299,7 @@ static __device__ __forceinline__ FastBrdfValueGrad sample_fast_brdf_with_grads(
         const float3 H = sample_fast_brdf_ggx_half_vector(normal, rough, rand.x, rand.y);
         const float rawVdotH = dot(wo, H);
         L                   = 2.0f * rawVdotH * H - wo;
+        const bool validNextDirection = dot(normal, L) > 0.0f;
 
         const float NdotV = fast_brdf_positive_dot(normal, wo);
         const float NdotL = fast_brdf_positive_dot(normal, L);
@@ -322,17 +342,43 @@ static __device__ __forceinline__ FastBrdfValueGrad sample_fast_brdf_with_grads(
         const float dk_droughness = rough * drough_dinput;
         const float dS_dRoughness = VdotH / denom * dG_dk * dk_droughness;
         dOut_dRoughness           = F * dS_dRoughness;
+
+        if ((drough_dinput > 0.0f) && validNextDirection) {
+            const float roughShifted = fast_brdf_clamp_roughness(roughness + FastBrdfRoughnessGradEps);
+            const float roughStep    = roughShifted - rough;
+            if (roughStep > FastBrdfEps) {
+                const float3 shiftedH = sample_fast_brdf_ggx_half_vector(normal, roughShifted, rand.x, rand.y);
+                const float3 shiftedL = 2.0f * dot(wo, shiftedH) * shiftedH - wo;
+                if (dot(normal, shiftedL) > 0.0f) {
+                    dNextDir_dRoughness = (shiftedL - L) / roughStep;
+                }
+            }
+        }
+
+        if (!validNextDirection) {
+            outFactor            = make_float3(0.0f);
+            dOut_dAlbedo         = make_float3(0.0f);
+            dOut_dRoughness      = make_float3(0.0f);
+            dNextDir_dRoughness  = make_float3(0.0f);
+#ifdef ENABLE_METALLIC
+            dOut_dMetallic       = make_float3(0.0f);
+#endif
+            L                    = normal;
+        }
     }
 
-    nextRayDirection = L;
-    if (dot(normal, nextRayDirection) <= 0.0f) {
-        nextRayDirection = normal;
-    }
-
-    const float3 valueMask = fast_brdf_nonnegative_grad_mask(outFactor);
+    const float3 brdfValue = eval_fast_brdf_sample_value(
+        wo,
+        normal,
+        albedo,
+        metallic,
+        roughness,
+        rand,
+        nextRayDirection);
+    const float3 valueMask = fast_brdf_nonnegative_grad_mask(brdfValue);
 
     FastBrdfValueGrad result;
-    result.value                = fast_brdf_clamp_nonnegative(outFactor * 2.0f);
+    result.value                = brdfValue;
     result.dBrdf_dAlbedo        = dOut_dAlbedo * 2.0f * valueMask;
     result.dBrdf_dRoughness     = dOut_dRoughness * 2.0f * valueMask;
 #ifdef ENABLE_METALLIC
@@ -340,6 +386,7 @@ static __device__ __forceinline__ FastBrdfValueGrad sample_fast_brdf_with_grads(
 #else
     result.dBrdf_dMetallic      = make_float3(0.0f);
 #endif
+    result.dNextDir_dRoughness  = dNextDir_dRoughness;
     return result;
 }
 

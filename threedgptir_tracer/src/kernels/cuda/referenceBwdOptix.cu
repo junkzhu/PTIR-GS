@@ -54,6 +54,7 @@ extern "C" __global__ void __raygen__rg() {
 
     for (unsigned int depth = 0; depth < params.maxBounces && path.active; ++depth) {
         accumulateLightContributionBwd(path, params);
+        PendingRayDirectionGradBwd(path, params);
 
         path.active &= (depth + 1u < path.maxBounces) && path.currentRayPayload.interaction.valid;
         if (!path.active) { break; }

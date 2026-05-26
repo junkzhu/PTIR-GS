@@ -46,6 +46,21 @@ from threedgrut.utils.normal import NormalUtils
 from threedgrut.utils.render import RGB2SH
 
 
+_MATERIAL_ROUGHNESS_MIN = 0.09
+_MATERIAL_ROUGHNESS_RANGE = 0.9
+_MATERIAL_ROUGHNESS_NAN = 1e-8
+
+
+def _bounded_material_roughness_activation(x: torch.Tensor) -> torch.Tensor:
+    roughness = torch.sigmoid(x) * _MATERIAL_ROUGHNESS_RANGE + _MATERIAL_ROUGHNESS_MIN
+    return torch.nan_to_num(roughness, nan=_MATERIAL_ROUGHNESS_NAN)
+
+
+def _bounded_material_roughness_activation_inv(y: torch.Tensor) -> torch.Tensor:
+    scaled = (y - _MATERIAL_ROUGHNESS_MIN) / _MATERIAL_ROUGHNESS_RANGE
+    return torch.log(scaled / (1.0 - scaled))
+
+
 class MixtureOfGaussians(torch.nn.Module, ExportableModel):
     """ """
 
@@ -221,8 +236,8 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.shading_normal_activation = get_activation_function("normalize")
         self.material_albedo_activation = get_activation_function("sigmoid")
         self.material_albedo_activation_inv = get_activation_function("sigmoid", inverse=True)
-        self.material_roughness_activation = get_activation_function("sigmoid")
-        self.material_roughness_activation_inv = get_activation_function("sigmoid", inverse=True)
+        self.material_roughness_activation = _bounded_material_roughness_activation
+        self.material_roughness_activation_inv = _bounded_material_roughness_activation_inv
         self.material_metallic_activation = get_activation_function("sigmoid")
         self.material_metallic_activation_inv = get_activation_function("sigmoid", inverse=True)
 
