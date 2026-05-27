@@ -228,6 +228,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
 
         self.background = background.make(self.conf.model.background.name, self.conf.model.background)
         self.environment = None
+        self.environment_alias_table = None
         self.optimize_environment = False
 
         # Check if we would like to do progressive training

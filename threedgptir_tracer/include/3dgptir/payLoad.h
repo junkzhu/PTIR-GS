@@ -56,6 +56,8 @@ struct rayPayload {
         lastHitDistance          = initialLastHitDistance;
         depthDistortion          = 0.f;
         hitsCount                = 0.f;
+        scatterPdf               = 0.f;
+        lightPdf                 = 0.f;
         hit                      = 0;
         valid                    = false;
     }
@@ -73,6 +75,9 @@ struct rayPayload {
     float lastHitDistance;
     float depthDistortion;
     float hitsCount;
+
+    float scatterPdf;
+    float lightPdf;
 
     unsigned int hit;
     bool valid;
@@ -103,6 +108,7 @@ struct pathPayload {
     unsigned int maxBounces;
 
     rayPayload currentRayPayload;
+    rayPayload emitterRayPayload;
 
     float3 accumulatedLighting;
     float3 accumulatedLightingGrad;

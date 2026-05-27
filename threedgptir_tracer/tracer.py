@@ -68,6 +68,7 @@ class Tracer:
             mog_mrgh,
             mog_mmet,
             environment,
+            environment_alias_table,
             render_opts,
             sph_degree,
             min_transmittance,
@@ -98,6 +99,7 @@ class Tracer:
                 mog_sph,
                 mog_snrm,
                 environment,
+                environment_alias_table,
                 render_opts,
                 sph_degree,
                 min_transmittance,
@@ -121,6 +123,7 @@ class Tracer:
                 mog_sph,
                 mog_snrm,
                 environment,
+                environment_alias_table,
             )
             ctx.frame_id = frame_id
             ctx.render_opts = render_opts
@@ -177,6 +180,7 @@ class Tracer:
                 mog_sph,
                 mog_snrm,
                 environment,
+                environment_alias_table,
             ) = ctx.saved_variables
             frame_id = ctx.frame_id
             particle_density_grd, particle_material_grd, mog_sph_grd, mog_sn_grd, environment_grd = ctx.tracer_wrapper.trace_bwd(
@@ -198,6 +202,7 @@ class Tracer:
                 mog_sph,
                 mog_snrm,
                 environment,
+                environment_alias_table,
                 ray_radiance_grd,
                 ray_density_grd,
                 ray_hit_distance_grd,
@@ -234,6 +239,7 @@ class Tracer:
                 mog_mrgh_grd,
                 mog_mmet_grd,
                 environment_grd,
+                None,
                 None,
                 None,
                 None,
@@ -304,8 +310,9 @@ class Tracer:
             self.conf.render.particle_radiance_sph_degree,
             self.conf.render.enable_normals,
             self.conf.render.enable_hitcounts,
+            self.conf.render.enable_mis,
             self.conf.render.get("enable_metallic", self.conf.model.get("optimize_material_metallic", False)),
-            self.conf.render.get("visualize_environment", False),
+            self.conf.render.visualize_environment,
         )
 
         self.frame_timer = CudaTimer() if self.conf.render.enable_kernel_timings else None
@@ -450,6 +457,18 @@ class Tracer:
                     jitter=chunk_jitter,
                 )
                 environment = gaussians.get_environment()
+                alias_table = getattr(gaussians, "environment_alias_table", None)
+                if alias_table is None:
+                    environment_alias_table = torch.empty(0, dtype=torch.float32, device=rays_dir.device)
+                else:
+                    environment_alias_table = torch.concat(
+                        [
+                            alias_table.prob.reshape(1, alias_table.height, alias_table.width),
+                            alias_table.alias.reshape(1, alias_table.height, alias_table.width).to(dtype=torch.float32),
+                            alias_table.pdf.reshape(1, alias_table.height, alias_table.width),
+                        ],
+                        dim=0,
+                    ).to(device=rays_dir.device).contiguous()
 
                 (
                     chunk_pred_rgb,
@@ -480,6 +499,7 @@ class Tracer:
                     gaussians.get_material_roughness().contiguous(),
                     gaussians.get_material_metallic().contiguous(),
                     environment,
+                    environment_alias_table,
                     int(Tracer.RenderOpts.INDIRECT if sh_indirect else Tracer.RenderOpts.DEFAULT),
                     gaussians.n_active_features,
                     self.conf.render.min_transmittance,

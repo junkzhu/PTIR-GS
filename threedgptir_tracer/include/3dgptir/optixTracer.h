@@ -105,6 +105,7 @@ protected:
         int particleRadianceSphDegree,
         bool enableNormals,
         bool enableHitCounts,
+        bool enableMIS,
         bool enableMetallic,
         bool enableVisualizeEnvironment);
     void createPipeline(const OptixDeviceContext context,
@@ -138,6 +139,7 @@ public:
         int particleRadianceSphDegree,
         bool enableNormals,
         bool enableHitCounts,
+        bool enableMIS,
         bool enableMetallic,
         bool enableVisualizeEnvironment);
 
@@ -153,6 +155,7 @@ public:
         torch::Tensor particleRadiance,
         torch::Tensor particleShadingNormal,
         torch::Tensor environment,
+        torch::Tensor environmentAliasTable,
         uint32_t shIndirect,
         int sphDegree,
         float minTransmittance,
@@ -177,6 +180,7 @@ public:
         torch::Tensor particleRadiance,
         torch::Tensor particleShadingNormal,
         torch::Tensor environment,
+        torch::Tensor environmentAliasTable,
         torch::Tensor rayRadGrd,
         torch::Tensor rayDnsGrd,
         torch::Tensor rayHitGrd,

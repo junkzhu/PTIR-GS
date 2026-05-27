@@ -16,6 +16,7 @@ model:
   optimize_material_roughness: true
   optimize_material_metallic: false
   optimize_environment: true
+  alias_table_update_frequency: 32
 
 environment:
   path: null

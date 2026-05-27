@@ -197,12 +197,31 @@ inline MOGPrimitiveTypes primitiveTypeFromStr(const std::string& primitiveTypeSt
 // OptixTracer
 //------------------------------------------------------------------------------
 
+EnvAliasTable::EnvAliasTable(const torch::Tensor& table)
+    : width(0),
+      height(0),
+      numCells(0),
+      prob(nullptr),
+      alias(nullptr),
+      pdf(nullptr) {
+    if (table.dim() == 3 && table.size(0) == 3 && table.size(1) > 0 && table.size(2) > 0 && table.numel() > 0) {
+        height = static_cast<int>(table.size(1));
+        width  = static_cast<int>(table.size(2));
+        const int cells = width * height;
+        numCells = cells;
+        prob     = table.data_ptr<float>();
+        alias    = prob + cells;
+        pdf      = prob + 2 * cells;
+    }
+}
+
 Environment::Environment(const torch::Tensor& environment)
     : data(nullptr),
       width(0),
       height(0),
       type(EnvironmentType_2D),
-      offset{0.0f, 0.0f} {
+      offset{0.0f, 0.0f},
+      aliasTable() {
     if (environment.dim() >= 3 && environment.size(0) > 0 && environment.size(1) > 0 && environment.size(2) == 4 && environment.numel() > 0) {
         data   = reinterpret_cast<const float4*>(environment.data_ptr<float>());
         height = static_cast<int>(environment.size(0));
@@ -213,12 +232,18 @@ Environment::Environment(const torch::Tensor& environment)
     }
 }
 
+Environment::Environment(const torch::Tensor& environment, const torch::Tensor& aliasTable)
+    : Environment(environment) {
+    this->aliasTable = EnvAliasTable(aliasTable);
+}
+
 std::vector<std::string> OptixTracer::generateDefines(
     float particleKernelDegree,
     bool particleKernelDensityClamping,
     int particleRadianceSphDegree,
     bool enableNormals,
     bool enableHitCounts,
+    bool enableMIS,
     bool enableMetallic,
     bool enableVisualizeEnvironment) {
     std::vector<std::string> defines;
@@ -229,6 +254,9 @@ std::vector<std::string> OptixTracer::generateDefines(
         }
         if (enableHitCounts) {
             defines.emplace_back("-DENABLE_HIT_COUNTS");
+        }
+        if (enableMIS) {
+            defines.emplace_back("-DENABLE_MIS");
         }
         if (enableMetallic) {
             defines.emplace_back("-DENABLE_METALLIC");
@@ -255,6 +283,7 @@ OptixTracer::OptixTracer(
     int particleRadianceSphDegree,
     bool enableNormals,
     bool enableHitCounts,
+    bool enableMIS,
     bool enableMetallic,
     bool enableVisualizeEnvironment) {
 
@@ -292,7 +321,7 @@ OptixTracer::OptixTracer(
     _state->gPrimNumTri                   = 0;
 
     std::vector<std::string> defines = generateDefines(particleKernelDegree, particleKernelDensityClamping,
-                                                       particleRadianceSphDegree, enableNormals, enableHitCounts, enableMetallic, enableVisualizeEnvironment);
+                                                       particleRadianceSphDegree, enableNormals, enableHitCounts, enableMIS, enableMetallic, enableVisualizeEnvironment);
 
     const uint32_t sharedFlags =
         (_state->gPrimType == MOGTracingSphere ? PipelineFlag_SpherePrim : ((_state->gPrimType == MOGTracingCustom) || (_state->gPrimType == MOGTracingInstances) ? PipelineFlag_HasIS : 0));
@@ -887,6 +916,7 @@ OptixTracer::trace(uint32_t frameNumber,
                    torch::Tensor particleRadiance,
                    torch::Tensor particleShadingNormal,
                    torch::Tensor environment,
+                   torch::Tensor environmentAliasTable,
                    uint32_t shIndirect,
                    int sphDegree,
                    float minTransmittance,
@@ -945,7 +975,7 @@ OptixTracer::trace(uint32_t frameNumber,
     paramsHost.rayPbr         = packed_accessor32<float, 4>(rayPbr);
     paramsHost.rayPbrComponents = packed_accessor32<float, 5>(rayPbrComponents);
 
-    paramsHost.environment = Environment(environment);
+    paramsHost.environment = Environment(environment, environmentAliasTable);
 
     cudaStream_t cudaStream = at::cuda::getCurrentCUDAStream();
     reallocateParamsDevice(sizeof(paramsHost), cudaStream);
@@ -982,6 +1012,7 @@ OptixTracer::traceBwd(uint32_t frameNumber,
                       torch::Tensor particleRadiance,
                       torch::Tensor particleShadingNormal,
                       torch::Tensor environment,
+                      torch::Tensor environmentAliasTable,
                       torch::Tensor rayRadGrd,
                       torch::Tensor rayDnsGrd,
                       torch::Tensor rayHitGrd,
@@ -1057,7 +1088,7 @@ OptixTracer::traceBwd(uint32_t frameNumber,
     paramsHost.rayPbrGrad         = packed_accessor32<float, 4>(rayPbrGrd);
     paramsHost.environmentGrad    = packed_accessor32<float, 3>(environmentGrad);
 
-    paramsHost.environment = Environment(environment);
+    paramsHost.environment = Environment(environment, environmentAliasTable);
 
     cudaStream_t cudaStream = at::cuda::getCurrentCUDAStream();
 

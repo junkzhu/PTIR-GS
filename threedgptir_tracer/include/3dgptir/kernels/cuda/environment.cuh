@@ -8,7 +8,10 @@
 #include <3dgptir/environment.h>
 #include <3dgptir/mathUtils.h>
 #include <3dgptir/payLoad.h>
+#include <3dgptir/kernels/cuda/sampler.cuh>
 #include <math_constants.h>
+
+static __device__ __forceinline__ float misWeight(float pdfA, float pdfB);
 
 static __device__ __forceinline__ int environmentClampInt(int value, int lo, int hi) {
     return max(lo, min(value, hi));
@@ -123,6 +126,103 @@ static __device__ __forceinline__ float3 rotateEnvironmentDirection(const float3
         rotatedDir.y * sinf(rotX) + rotatedDir.z * cosf(rotX));
 }
 
+static __device__ __forceinline__ float3 inverseRotateEnvironmentDirection(const float3& envDir) {
+    const float rotZ = params.environment.offset.x * 2.0f * CUDART_PI_F + 0.5f * CUDART_PI_F;
+    const float rotX = params.environment.offset.y * 2.0f * CUDART_PI_F;
+    float sinZ;
+    float cosZ;
+    sincosf(rotZ, &sinZ, &cosZ);
+    float sinX;
+    float cosX;
+    sincosf(rotX, &sinX, &cosX);
+
+    const float3 xRotatedDir = make_float3(
+        envDir.x,
+        envDir.y * cosX + envDir.z * sinX,
+        -envDir.y * sinX + envDir.z * cosX);
+
+    return make_float3(
+        xRotatedDir.x * cosZ + xRotatedDir.y * sinZ,
+        -xRotatedDir.x * sinZ + xRotatedDir.y * cosZ,
+        xRotatedDir.z);
+}
+
+static __device__ __forceinline__ float3 environmentEquirectUVToDirection(float u, float v) {
+    u = u - floorf(u);
+    v = fminf(fmaxf(v, 0.0f), 1.0f);
+
+    const float theta = u * 2.0f * CUDART_PI_F - CUDART_PI_F;
+    const float phi   = (v - 0.5f) * CUDART_PI_F;
+    float sinTheta;
+    float cosTheta;
+    sincosf(theta, &sinTheta, &cosTheta);
+    float sinPhi;
+    float cosPhi;
+    sincosf(phi, &sinPhi, &cosPhi);
+
+    return make_float3(sinTheta * cosPhi, cosTheta * cosPhi, -sinPhi);
+}
+
+static __device__ __forceinline__ float3 environmentCubemapFaceUVToDirection(int face, float u, float v) {
+    u = fminf(fmaxf(u, 0.0f), 1.0f);
+    v = fminf(fmaxf(v, 0.0f), 1.0f);
+
+    const float s = 2.0f * u - 1.0f;
+    const float t = 2.0f * v - 1.0f;
+    float3 dir;
+    switch (face) {
+    case 0:
+        dir = make_float3(1.0f, -t, -s);
+        break;
+    case 1:
+        dir = make_float3(-1.0f, -t, s);
+        break;
+    case 2:
+        dir = make_float3(s, 1.0f, t);
+        break;
+    case 3:
+        dir = make_float3(s, -1.0f, -t);
+        break;
+    case 4:
+        dir = make_float3(s, -t, 1.0f);
+        break;
+    default:
+        dir = make_float3(-s, -t, -1.0f);
+        break;
+    }
+    return safe_normalize(dir);
+}
+
+static __device__ __forceinline__ float3 sampleEnvironmentAliasDirection(
+    Sampler& sampler,
+    float& pdf) {
+    const EnvAliasTable& aliasTable = params.environment.aliasTable;
+
+    const int initialCell = min(static_cast<int>(sampler.next_1d() * aliasTable.numCells), aliasTable.numCells - 1);
+    const int aliasCell   = environmentClampInt(static_cast<int>(aliasTable.alias[initialCell] + 0.5f), 0, aliasTable.numCells - 1);
+    const int cell        = sampler.next_1d() < aliasTable.prob[initialCell] ? initialCell : aliasCell;
+    const int x           = cell % aliasTable.width;
+    const int y           = cell / aliasTable.width;
+
+    float3 envDirection;
+    if (params.environment.type == EnvironmentType_Cube) {
+        const int faceSize = aliasTable.width;
+        const int face     = environmentClampInt(y / faceSize, 0, 5);
+        const int faceY    = y - face * faceSize;
+        envDirection = environmentCubemapFaceUVToDirection(
+            face,
+            (static_cast<float>(x) + sampler.next_1d()) / static_cast<float>(faceSize),
+            (static_cast<float>(faceY) + sampler.next_1d()) / static_cast<float>(faceSize));
+    } else {
+        envDirection = environmentEquirectUVToDirection(
+            (static_cast<float>(x) + sampler.next_1d()) / static_cast<float>(aliasTable.width),
+            (static_cast<float>(y) + sampler.next_1d()) / static_cast<float>(aliasTable.height));
+    }
+
+    pdf = aliasTable.pdf[cell];
+    return inverseRotateEnvironmentDirection(envDirection);
+}
+
 static __device__ __forceinline__ void dirToCubemapFaceUV(const float3& dir, int& face, float& u, float& v) {
     const float absX = fabsf(dir.x);
     const float absY = fabsf(dir.y);
@@ -167,6 +267,33 @@ static __device__ __forceinline__ void dirToCubemapFaceUV(const float3& dir, int
     const float invMa = 1.0f / fmaxf(ma, 1e-12f);
     u = 0.5f * (sc * invMa + 1.0f);
     v = 0.5f * (tc * invMa + 1.0f);
+}
+
+static __device__ __forceinline__ float environmentAliasPdf(const float3& rayDir) {
+    const EnvAliasTable& aliasTable = params.environment.aliasTable;
+    const float3 dir = rotateEnvironmentDirection(rayDir);
+
+    int x;
+    int y;
+    if (params.environment.type == EnvironmentType_Cube) {
+        int face;
+        float u, v;
+        dirToCubemapFaceUV(dir, face, u, v);
+        const int faceSize = aliasTable.width;
+        x = environmentClampInt(static_cast<int>(u * static_cast<float>(faceSize)), 0, faceSize - 1);
+        const int faceY = environmentClampInt(static_cast<int>(v * static_cast<float>(faceSize)), 0, faceSize - 1);
+        y = face * faceSize + faceY;
+    } else {
+        const float theta = atan2f(dir.x, dir.y);
+        const float zcl   = fminf(1.0f, fmaxf(-1.0f, -dir.z));
+        const float phi   = asinf(zcl);
+        const float u     = (theta + CUDART_PI_F) * (0.5f * (1.0f / CUDART_PI_F));
+        const float v     = 0.5f + phi * (1.0f / CUDART_PI_F);
+        x = environmentWrapInt(static_cast<int>(u * static_cast<float>(aliasTable.width)), aliasTable.width);
+        y = environmentClampInt(static_cast<int>(v * static_cast<float>(aliasTable.height)), 0, aliasTable.height - 1);
+    }
+
+    return aliasTable.pdf[y * aliasTable.width + x];
 }
 
 static __device__ __forceinline__ EnvironmentBilinearFootprint computeCubemapBilinearFootprint(
@@ -273,24 +400,63 @@ static __device__ __forceinline__ float3 getBackgroundColorBwd(
 static __device__ __forceinline__ void accumulateLightContribution(pathPayload& path) {
     path.currentRayPayload.contribution = make_float3(0.0f);
     const bool hasEnvironment = params.environment.data != nullptr && params.environment.width > 0 && params.environment.height > 0;
-    if (params.renderOpts) {
+    const bool firstSecondaryBounce = path.numBounces == 1u;
+
+#ifdef ENABLE_MIS
+    const float brdfSideMis = firstSecondaryBounce
+        ? misWeight(path.currentRayPayload.scatterPdf, path.currentRayPayload.lightPdf)
+        : 1.0f;
+    const float lightSideMis = firstSecondaryBounce
+        ? misWeight(path.emitterRayPayload.lightPdf, path.emitterRayPayload.scatterPdf)
+        : 1.0f;
+    const float3 neeContribution = path.emitterRayPayload.contribution * lightSideMis;
+#endif
+
+    if (params.renderOpts == 1) {
+#ifdef ENABLE_MIS
+        if (firstSecondaryBounce) {
+            path.accumulatedLighting += neeContribution;
+        }
+#endif
         if (path.numBounces > 0u && path.currentRayPayload.interaction.valid) {
             path.currentRayPayload.contribution = path.pathThroughput * path.currentRayPayload.radiance;
+#ifdef ENABLE_MIS
+            if (firstSecondaryBounce) {
+                path.currentRayPayload.contribution *= brdfSideMis;
+            }
+#endif
             path.accumulatedLighting += path.currentRayPayload.contribution;
             path.accumulatedIndirectLighting += path.currentRayPayload.contribution;
         } else if (path.currentRayPayload.valid && hasEnvironment) {
             path.pathThroughput *= path.currentRayPayload.transmittance;
             path.currentRayPayload.contribution = path.pathThroughput * getBackgroundColor(path.currentRayPayload.ray.direction);
+#ifdef ENABLE_MIS
+            if (firstSecondaryBounce) {
+                path.currentRayPayload.contribution *= brdfSideMis;
+            }
+#endif
             path.accumulatedLighting += path.currentRayPayload.contribution;
             path.accumulatedDirectLighting += path.currentRayPayload.contribution;
         }
         return;
     }
 
+#ifdef ENABLE_MIS
+    if (firstSecondaryBounce) {
+        path.accumulatedLighting += neeContribution;
+        path.accumulatedDirectLighting += neeContribution;
+    }
+#endif
+
     if (path.currentRayPayload.valid && hasEnvironment) {
         path.pathThroughput *= path.currentRayPayload.transmittance;
 
         path.currentRayPayload.contribution = path.pathThroughput * getBackgroundColor(path.currentRayPayload.ray.direction);
+#ifdef ENABLE_MIS
+        if (firstSecondaryBounce) {
+            path.currentRayPayload.contribution *= brdfSideMis;
+        }
+#endif
         path.currentRayPayload.radiance += path.currentRayPayload.contribution;
         path.accumulatedLighting += path.currentRayPayload.contribution;
 
@@ -308,26 +474,75 @@ static __device__ __forceinline__ void accumulateLightContributionBwd(
     PipelineParams& pipelineParams) {
     path.currentRayPayload.contribution = make_float3(0.0f);
     const bool hasEnvironment = params.environment.data != nullptr && params.environment.width > 0 && params.environment.height > 0;
-    if (params.renderOpts) {
+    const bool firstSecondaryBounce = path.numBounces == 1u;
+
+#ifdef ENABLE_MIS
+    const float brdfSideMis = firstSecondaryBounce
+        ? misWeight(path.currentRayPayload.scatterPdf, path.currentRayPayload.lightPdf)
+        : 1.0f;
+    const float lightSideMis = firstSecondaryBounce
+        ? misWeight(path.emitterRayPayload.lightPdf, path.emitterRayPayload.scatterPdf)
+        : 1.0f;
+#endif
+
+    if (params.renderOpts == 1) {
+#ifdef ENABLE_MIS
+        if (firstSecondaryBounce) {
+            const float3 neeContribution = path.emitterRayPayload.contribution * lightSideMis;
+            path.accumulatedLighting -= neeContribution;
+        }
+#endif
         if (path.numBounces > 0u && path.currentRayPayload.interaction.valid) {
             path.currentRayPayload.contribution = path.pathThroughput * path.currentRayPayload.radiance;
+#ifdef ENABLE_MIS
+            if (firstSecondaryBounce) {
+                path.currentRayPayload.contribution *= brdfSideMis;
+            }
+#endif
             path.accumulatedLighting -= path.currentRayPayload.contribution;
         } else if (path.currentRayPayload.valid && hasEnvironment) {
             path.pathThroughput *= path.currentRayPayload.transmittance;
-            const float3 environmentGrad = path.accumulatedLightingGrad * path.pathThroughput;
+            float3 environmentGrad = path.accumulatedLightingGrad * path.pathThroughput;
+#ifdef ENABLE_MIS
+            if (firstSecondaryBounce) {
+                environmentGrad *= brdfSideMis;
+            }
+#endif
             const float3 background = getBackgroundColorBwd(path.currentRayPayload.ray.direction, environmentGrad, pipelineParams);
             path.currentRayPayload.contribution = path.pathThroughput * background;
+#ifdef ENABLE_MIS
+            if (firstSecondaryBounce) {
+                path.currentRayPayload.contribution *= brdfSideMis;
+            }
+#endif
             path.accumulatedLighting -= path.currentRayPayload.contribution;
         }
         return;
     }
 
+#ifdef ENABLE_MIS
+    if (firstSecondaryBounce) {
+        const float3 neeContribution = path.emitterRayPayload.contribution * lightSideMis;
+        path.accumulatedLighting -= neeContribution;
+    }
+#endif
+
     if (path.currentRayPayload.valid && hasEnvironment) {
         path.pathThroughput *= path.currentRayPayload.transmittance;
 
-        const float3 environmentGrad = path.accumulatedLightingGrad * path.pathThroughput;
+        float3 environmentGrad = path.accumulatedLightingGrad * path.pathThroughput;
+#ifdef ENABLE_MIS
+        if (firstSecondaryBounce) {
+            environmentGrad *= brdfSideMis;
+        }
+#endif
         const float3 background = getBackgroundColorBwd(path.currentRayPayload.ray.direction, environmentGrad, pipelineParams);
         path.currentRayPayload.contribution = path.pathThroughput * background;
+#ifdef ENABLE_MIS
+        if (firstSecondaryBounce) {
+            path.currentRayPayload.contribution *= brdfSideMis;
+        }
+#endif
         path.currentRayPayload.radiance += path.currentRayPayload.contribution;
         path.accumulatedLighting -= path.currentRayPayload.contribution;
     }

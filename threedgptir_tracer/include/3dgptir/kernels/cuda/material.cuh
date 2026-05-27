@@ -26,6 +26,7 @@
 static constexpr float FastBrdfEps      = 1e-6f;
 static constexpr float FastBrdfMinRough = 0.05f;
 static constexpr float FastBrdfPi2      = 6.28318530717958647692f;
+static constexpr float FastBrdfInvPi    = 0.31830988618379067154f;
 
 #ifdef FAST_BRDF_GUARD_NAN
 static constexpr float FastBrdfMaxValue = 1e20f;
@@ -125,7 +126,8 @@ static __device__ __forceinline__ float3 compute_fast_brdf_fresnel_schlick(const
 static __device__ __forceinline__ float3 sample_fast_brdf_diffuse_direction(
     const float3& normal,
     const float u1,
-    const float u2) {
+    const float u2,
+    float& directionPdf) {
     const float xi  = fast_brdf_saturate(u1);
     const float r   = sqrtf(xi);
     const float phi = FastBrdfPi2 * fast_brdf_saturate(u2);
@@ -134,16 +136,20 @@ static __device__ __forceinline__ float3 sample_fast_brdf_diffuse_direction(
     sincosf(phi, &s, &c);
 
     const float z = sqrtf(fmaxf(0.0f, 1.0f - xi));
+#ifdef ENABLE_MIS
+    directionPdf  = z * FastBrdfInvPi;
+#endif
     const float3 localDir = make_float3(r * c, r * s, z);
     return compute_fast_brdf_normal_space(normal, localDir);
 }
 
 static __device__ __forceinline__ float3 sample_fast_brdf_ggx_half_vector(
     const float3& normal,
-    const float roughness,
+    const float rough,
     const float u1,
-    const float u2) {
-    const float rough  = fast_brdf_clamp_roughness(roughness);
+    const float u2,
+    float& sampledNdotH,
+    float& halfVectorPdf) {
     const float alpha  = rough * rough;
     const float alpha2 = alpha * alpha;
     const float xi     = fast_brdf_saturate(u1);
@@ -152,6 +158,11 @@ static __device__ __forceinline__ float3 sample_fast_brdf_ggx_half_vector(
     const float cosTheta = sqrtf(fmaxf(0.0f, (1.0f - xi) / denom));
     const float sinTheta = sqrtf(fmaxf(0.0f, 1.0f - cosTheta * cosTheta));
     const float phi      = FastBrdfPi2 * fast_brdf_saturate(u2);
+    sampledNdotH         = cosTheta;
+    halfVectorPdf        = 0.0f;
+#ifdef ENABLE_MIS
+    halfVectorPdf = denom * denom * FastBrdfInvPi * cosTheta / alpha2;
+#endif
     float s;
     float c;
     sincosf(phi, &s, &c);
@@ -160,36 +171,46 @@ static __device__ __forceinline__ float3 sample_fast_brdf_ggx_half_vector(
     return compute_fast_brdf_normal_space(normal, localH);
 }
 
-static __device__ __forceinline__ float3 sample_fast_brdf(
+static __device__ __forceinline__ float3 sample_fast_brdf_throughput(
     const float3& wo,
     const float3& normal,
     const float3& albedo,
     const float metallic,
     const float roughness,
     const float3& rand,
-    float3& nextRayDirection) {
+    float3& nextRayDirection,
+    float& scatterPdf) {
     const float rough = fast_brdf_clamp_roughness(roughness);
     const float3 f0   = compute_fast_brdf_f0(albedo, metallic);
 
     float3 outFactor = make_float3(0.0f);
     float3 L         = normal;
+    scatterPdf       = 0.0f;
 
     if (rand.z < 0.5f) {
-        L = sample_fast_brdf_diffuse_direction(normal, rand.x, rand.y);
+        float directionPdf = 0.0f;
+        L = sample_fast_brdf_diffuse_direction(normal, rand.x, rand.y, directionPdf);
+#ifdef ENABLE_MIS
+        scatterPdf = 0.5f * directionPdf;
+#endif
         const float3 H = fast_brdf_safe_normalize(wo + L, normal);
         const float3 F = compute_fast_brdf_fresnel_schlick(fast_brdf_positive_dot(wo, H), f0);
 
         const float3 diffuseColor = albedo * (1.0f - metallic);
         outFactor                 = diffuseColor * (make_float3(1.0f) - F);
     } else {
-        const float3 H = sample_fast_brdf_ggx_half_vector(normal, rough, rand.x, rand.y);
+        float NdotH = 0.0f;
+        float halfVectorPdf = 0.0f;
+        const float3 H = sample_fast_brdf_ggx_half_vector(normal, rough, rand.x, rand.y, NdotH, halfVectorPdf);
         const float rawVdotH = dot(wo, H);
         L                   = 2.0f * rawVdotH * H - wo;
 
         const float NdotV = fast_brdf_positive_dot(normal, wo);
         const float NdotL = fast_brdf_positive_dot(normal, L);
-        const float NdotH = fast_brdf_positive_dot(normal, H);
-        const float VdotH = fast_brdf_positive_dot(wo, H);
+        const float VdotH = fast_brdf_saturate(rawVdotH);
+#ifdef ENABLE_MIS
+        scatterPdf = ((NdotL > 0.0f) && (NdotV > 0.0f) && (VdotH > 0.0f)) ? 0.5f * halfVectorPdf / fmaxf(4.0f * VdotH, FastBrdfEps) : 0.0f;
+#endif
 
         const float3 F = compute_fast_brdf_fresnel_schlick(VdotH, f0);
 
@@ -231,14 +252,15 @@ static __device__ __forceinline__ float3 fast_brdf_nonnegative_grad_mask(const f
         fast_brdf_nonnegative_grad_mask(v.z));
 }
 
-static __device__ __forceinline__ FastBrdfValueGrad sample_fast_brdf_with_grads(
+static __device__ __forceinline__ FastBrdfValueGrad sample_fast_brdf_throughput_with_grads(
     const float3& wo,
     const float3& normal,
     const float3& albedo,
     const float metallic,
     const float roughness,
     const float3& rand,
-    float3& nextRayDirection) {
+    float3& nextRayDirection,
+    float& scatterPdf) {
     const float rough = fast_brdf_clamp_roughness(roughness);
     const float3 f0   = compute_fast_brdf_f0(albedo, metallic);
 
@@ -249,9 +271,14 @@ static __device__ __forceinline__ FastBrdfValueGrad sample_fast_brdf_with_grads(
     float3 dOut_dMetallic    = make_float3(0.0f);
 #endif
     float3 L                 = normal;
+    scatterPdf               = 0.0f;
 
     if (rand.z < 0.5f) {
-        L = sample_fast_brdf_diffuse_direction(normal, rand.x, rand.y);
+        float directionPdf = 0.0f;
+        L = sample_fast_brdf_diffuse_direction(normal, rand.x, rand.y, directionPdf);
+#ifdef ENABLE_MIS
+        scatterPdf = 0.5f * directionPdf;
+#endif
         const float3 H = fast_brdf_safe_normalize(wo + L, normal);
 
         const float cosTheta  = fast_brdf_positive_dot(wo, H);
@@ -277,14 +304,18 @@ static __device__ __forceinline__ FastBrdfValueGrad sample_fast_brdf_with_grads(
         dOut_dMetallic = -albedo * oneMinusF - albedo * oneMinusMetallic * dF_dMetallic;
 #endif
     } else {
-        const float3 H = sample_fast_brdf_ggx_half_vector(normal, rough, rand.x, rand.y);
+        float NdotH = 0.0f;
+        float halfVectorPdf = 0.0f;
+        const float3 H = sample_fast_brdf_ggx_half_vector(normal, rough, rand.x, rand.y, NdotH, halfVectorPdf);
         const float rawVdotH = dot(wo, H);
         L                   = 2.0f * rawVdotH * H - wo;
 
         const float NdotV = fast_brdf_positive_dot(normal, wo);
         const float NdotL = fast_brdf_positive_dot(normal, L);
-        const float NdotH = fast_brdf_positive_dot(normal, H);
-        const float VdotH = fast_brdf_positive_dot(wo, H);
+        const float VdotH = fast_brdf_saturate(rawVdotH);
+#ifdef ENABLE_MIS
+        scatterPdf = ((NdotL > 0.0f) && (NdotV > 0.0f) && (VdotH > 0.0f)) ? 0.5f * halfVectorPdf / fmaxf(4.0f * VdotH, FastBrdfEps) : 0.0f;
+#endif
 
         const float x         = 1.0f - fast_brdf_saturate(VdotH);
         const float x2        = x * x;
@@ -343,11 +374,15 @@ static __device__ __forceinline__ FastBrdfValueGrad sample_fast_brdf_with_grads(
     return result;
 }
 
-static __device__ __forceinline__ float3 sampled_fast_brdf(
+// Samples the material BRDF and returns the path-throughput multiplier for the
+// sampled direction. This is not a raw BRDF value: the cosine and the sampling
+// pdf are already folded into sample_fast_brdf_throughput().
+static __device__ __forceinline__ float3 sample_material_fast_brdf_throughput(
     const float3& rayDirection,
     Sampler& sampler,
     const Interaction& interaction,
-    float3& nextRayDirection) {
+    float3& nextRayDirection,
+    float& scatterPdf) {
     const float3 normalFallback = make_float3(0.0f, 0.0f, 1.0f);
     const float3 normal = fast_brdf_safe_normalize(interaction.shadingnormal, normalFallback);
     const float3 wo     = fast_brdf_safe_normalize(-rayDirection, normal);
@@ -356,14 +391,173 @@ static __device__ __forceinline__ float3 sampled_fast_brdf(
     const float metallic = fast_brdf_effective_metallic(interaction.material.metallic);
     const float roughness = fast_brdf_clamp_roughness(interaction.material.roughness);
 
-    return sample_fast_brdf(wo, normal, albedo, metallic, roughness, sampler.next_3d(), nextRayDirection);
+    return sample_fast_brdf_throughput(wo, normal, albedo, metallic, roughness, sampler.next_3d(), nextRayDirection, scatterPdf);
 }
 
-static __device__ __forceinline__ FastBrdfValueGrad sampled_fast_brdf_with_grads(
+// Evaluates a known light direction for NEE/MIS: returns f(wo, L) * cos(theta_L)
+// and the BRDF sampling pdf for that same L.
+static __device__ __forceinline__ float3 eval_fast_brdf_light_sample(
+    const float3& wo,
+    const float3& normal,
+    const float3& albedo,
+    const float metallic,
+    const float roughness,
+    const float3& lightDirection,
+    float& scatterPdf) {
+    const float3 L = fast_brdf_safe_normalize(lightDirection, normal);
+    const float NdotV = fast_brdf_positive_dot(normal, wo);
+    const float NdotL = fast_brdf_positive_dot(normal, L);
+    scatterPdf = 0.0f;
+    if (NdotV <= 0.0f || NdotL <= 0.0f) {
+        return make_float3(0.0f);
+    }
+
+    const float rough = fast_brdf_clamp_roughness(roughness);
+    const float3 f0   = compute_fast_brdf_f0(albedo, metallic);
+    const float3 H    = fast_brdf_safe_normalize(wo + L, normal);
+    const float NdotH = fast_brdf_positive_dot(normal, H);
+    const float VdotH = fast_brdf_positive_dot(wo, H);
+
+    const float3 F = compute_fast_brdf_fresnel_schlick(VdotH, f0);
+
+    const float3 diffuseColor = albedo * (1.0f - metallic);
+    const float3 diffuse      = diffuseColor * (make_float3(1.0f) - F) * (NdotL * FastBrdfInvPi);
+
+    const float alpha  = rough * rough;
+    const float alpha2 = alpha * alpha;
+    const float dDenom = fmaxf(NdotH * NdotH * (alpha2 - 1.0f) + 1.0f, FastBrdfEps);
+    const float D      = alpha2 * FastBrdfInvPi / fmaxf(dDenom * dDenom, FastBrdfEps);
+
+    const float k  = 0.5f * rough * rough;
+    const float Gv = NdotV / fmaxf(NdotV * (1.0f - k) + k, FastBrdfEps);
+    const float Gl = NdotL / fmaxf(NdotL * (1.0f - k) + k, FastBrdfEps);
+    const float G  = Gv * Gl;
+
+    const float3 specular = F * (D * G / fmaxf(4.0f * NdotV, FastBrdfEps));
+
+#ifdef ENABLE_MIS
+    const float diffusePdf = NdotL * FastBrdfInvPi;
+    const float specularPdf = (VdotH > 0.0f) ? (D * NdotH / fmaxf(4.0f * VdotH, FastBrdfEps)) : 0.0f;
+    scatterPdf = 0.5f * (diffusePdf + specularPdf);
+#endif
+
+    return fast_brdf_clamp_nonnegative(diffuse + specular);
+}
+
+// Evaluates the material for a light direction chosen elsewhere, e.g. by NEE.
+// This deliberately does not call the sampling path above: the direction is
+// fixed, so we need f(wo, L) * cos(theta_L) plus the BRDF pdf for MIS.
+static __device__ __forceinline__ float3 eval_material_fast_brdf_light_sample(
     const float3& rayDirection,
-    Sampler& sampler,
     const Interaction& interaction,
-    float3& nextRayDirection) {
+    const float3& lightDirection,
+    float& scatterPdf) {
+    const float3 normalFallback = make_float3(0.0f, 0.0f, 1.0f);
+    const float3 normal = fast_brdf_safe_normalize(interaction.shadingnormal, normalFallback);
+    const float3 wo     = fast_brdf_safe_normalize(-rayDirection, normal);
+
+    const float3 albedo = fast_brdf_saturate(interaction.material.albedo);
+    const float metallic = fast_brdf_effective_metallic(interaction.material.metallic);
+    const float roughness = fast_brdf_clamp_roughness(interaction.material.roughness);
+
+    return eval_fast_brdf_light_sample(wo, normal, albedo, metallic, roughness, lightDirection, scatterPdf);
+}
+
+// Gradient version of eval_fast_brdf_light_sample.
+static __device__ __forceinline__ FastBrdfValueGrad eval_fast_brdf_light_sample_with_grads(
+    const float3& wo,
+    const float3& normal,
+    const float3& albedo,
+    const float metallic,
+    const float roughness,
+    const float3& lightDirection,
+    float& scatterPdf) {
+    const float3 L = fast_brdf_safe_normalize(lightDirection, normal);
+    const float NdotV = fast_brdf_positive_dot(normal, wo);
+    const float NdotL = fast_brdf_positive_dot(normal, L);
+    scatterPdf = 0.0f;
+
+    FastBrdfValueGrad result;
+    result.value = make_float3(0.0f);
+    result.dBrdf_dAlbedo = make_float3(0.0f);
+    result.dBrdf_dRoughness = make_float3(0.0f);
+    result.dBrdf_dMetallic = make_float3(0.0f);
+    if (NdotV <= 0.0f || NdotL <= 0.0f) {
+        return result;
+    }
+
+    const float rough = fast_brdf_clamp_roughness(roughness);
+    const float3 f0   = compute_fast_brdf_f0(albedo, metallic);
+    const float3 H    = fast_brdf_safe_normalize(wo + L, normal);
+    const float NdotH = fast_brdf_positive_dot(normal, H);
+    const float VdotH = fast_brdf_positive_dot(wo, H);
+
+    const float x = 1.0f - fast_brdf_saturate(VdotH);
+    const float x2 = x * x;
+    const float q = x2 * x2 * x;
+    const float oneMinusQ = 1.0f - q;
+    const float3 F = f0 + (make_float3(1.0f) - f0) * q;
+
+    const float oneMinusMetallic = 1.0f - metallic;
+    const float3 diffuseColor = albedo * oneMinusMetallic;
+    const float diffuseScale = NdotL * FastBrdfInvPi;
+    const float3 diffuse = diffuseColor * (make_float3(1.0f) - F) * diffuseScale;
+
+    const float alpha  = rough * rough;
+    const float alpha2 = alpha * alpha;
+    const float dDenom = fmaxf(NdotH * NdotH * (alpha2 - 1.0f) + 1.0f, FastBrdfEps);
+    const float D = alpha2 * FastBrdfInvPi / fmaxf(dDenom * dDenom, FastBrdfEps);
+
+    const float k = 0.5f * rough * rough;
+    const float Dv = fmaxf(NdotV * (1.0f - k) + k, FastBrdfEps);
+    const float Dl = fmaxf(NdotL * (1.0f - k) + k, FastBrdfEps);
+    const float Gv = NdotV / Dv;
+    const float Gl = NdotL / Dl;
+    const float G = Gv * Gl;
+    const float specularScale = D * G / fmaxf(4.0f * NdotV, FastBrdfEps);
+    const float3 specular = F * specularScale;
+
+#ifdef ENABLE_MIS
+    const float diffusePdf = NdotL * FastBrdfInvPi;
+    const float specularPdf = (VdotH > 0.0f) ? (D * NdotH / fmaxf(4.0f * VdotH, FastBrdfEps)) : 0.0f;
+    scatterPdf = 0.5f * (diffusePdf + specularPdf);
+#endif
+
+    const float3 value = diffuse + specular;
+    const float3 valueMask = fast_brdf_nonnegative_grad_mask(value);
+    result.value = fast_brdf_clamp_nonnegative(value);
+
+    const float dF_dAlbedo = metallic * oneMinusQ;
+#ifdef ENABLE_METALLIC
+    const float3 dF_dMetallic = (albedo - make_float3(0.04f)) * oneMinusQ;
+    const float3 dDiffuse_dMetallic = (-albedo * (make_float3(1.0f) - F) - diffuseColor * dF_dMetallic) * diffuseScale;
+    const float3 dSpecular_dMetallic = dF_dMetallic * specularScale;
+    result.dBrdf_dMetallic = (dDiffuse_dMetallic + dSpecular_dMetallic) * valueMask;
+#endif
+
+    const float3 dDiffuse_dAlbedo = oneMinusMetallic * ((make_float3(1.0f) - F) - albedo * dF_dAlbedo) * diffuseScale;
+    const float3 dSpecular_dAlbedo = make_float3(dF_dAlbedo * specularScale);
+    result.dBrdf_dAlbedo = (dDiffuse_dAlbedo + dSpecular_dAlbedo) * valueMask;
+
+    const float dD_dAlpha2 = FastBrdfInvPi * (1.0f / fmaxf(dDenom * dDenom, FastBrdfEps) - (2.0f * alpha2 * NdotH * NdotH) / fmaxf(dDenom * dDenom * dDenom, FastBrdfEps));
+    const float dAlpha2_dRough = 4.0f * rough * rough * rough;
+    const float dD_dRough = dD_dAlpha2 * dAlpha2_dRough;
+    const float dGv_dk = -NdotV * (1.0f - NdotV) / (Dv * Dv);
+    const float dGl_dk = -NdotL * (1.0f - NdotL) / (Dl * Dl);
+    const float dG_dk = Gl * dGv_dk + Gv * dGl_dk;
+    const float dG_dRough = dG_dk * rough;
+    const float dSpecularScale_dRough = (dD_dRough * G + D * dG_dRough) / fmaxf(4.0f * NdotV, FastBrdfEps);
+    const float dRough_dInput = (roughness > FastBrdfMinRough && roughness < 1.0f) ? 1.0f : 0.0f;
+    result.dBrdf_dRoughness = F * (dSpecularScale_dRough * dRough_dInput) * valueMask;
+
+    return result;
+}
+
+static __device__ __forceinline__ FastBrdfValueGrad eval_material_fast_brdf_light_sample_with_grads(
+    const float3& rayDirection,
+    const Interaction& interaction,
+    const float3& lightDirection,
+    float& scatterPdf) {
     const float3 normalFallback = make_float3(0.0f, 0.0f, 1.0f);
     const float3 normal = fast_brdf_safe_normalize(interaction.shadingnormal, normalFallback);
     const float3 wo     = fast_brdf_safe_normalize(-rayDirection, normal);
@@ -372,7 +566,26 @@ static __device__ __forceinline__ FastBrdfValueGrad sampled_fast_brdf_with_grads
     const float metallic = fast_brdf_effective_metallic(interaction.material.metallic);
     const float roughness = interaction.material.roughness;
 
-    return sample_fast_brdf_with_grads(wo, normal, albedo, metallic, roughness, sampler.next_3d(), nextRayDirection);
+    return eval_fast_brdf_light_sample_with_grads(wo, normal, albedo, metallic, roughness, lightDirection, scatterPdf);
+}
+
+// Gradient version of sample_material_fast_brdf_throughput(). It follows the
+// sampled path-throughput estimator, not the fixed-direction NEE estimator.
+static __device__ __forceinline__ FastBrdfValueGrad sample_material_fast_brdf_throughput_with_grads(
+    const float3& rayDirection,
+    Sampler& sampler,
+    const Interaction& interaction,
+    float3& nextRayDirection,
+    float& scatterPdf) {
+    const float3 normalFallback = make_float3(0.0f, 0.0f, 1.0f);
+    const float3 normal = fast_brdf_safe_normalize(interaction.shadingnormal, normalFallback);
+    const float3 wo     = fast_brdf_safe_normalize(-rayDirection, normal);
+
+    const float3 albedo = fast_brdf_saturate(interaction.material.albedo);
+    const float metallic = fast_brdf_effective_metallic(interaction.material.metallic);
+    const float roughness = interaction.material.roughness;
+
+    return sample_fast_brdf_throughput_with_grads(wo, normal, albedo, metallic, roughness, sampler.next_3d(), nextRayDirection, scatterPdf);
 }
 
 #endif

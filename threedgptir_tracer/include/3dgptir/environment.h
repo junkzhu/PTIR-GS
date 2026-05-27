@@ -14,6 +14,28 @@ enum EnvironmentType {
     EnvironmentType_Cube = 1,
 };
 
+struct EnvAliasTable {
+#if defined(NVDR_TORCH) && !defined(__CUDACC__)
+    EnvAliasTable()
+        : width(0),
+          height(0),
+          numCells(0),
+          prob(nullptr),
+          alias(nullptr),
+          pdf(nullptr) {
+    }
+
+    explicit EnvAliasTable(const torch::Tensor& table);
+#endif
+
+    int width;
+    int height;
+    int numCells;
+    const float* prob;
+    const float* alias;
+    const float* pdf;
+};
+
 struct Environment {
 #if defined(NVDR_TORCH) && !defined(__CUDACC__)
     Environment()
@@ -21,10 +43,12 @@ struct Environment {
           width(0),
           height(0),
           type(EnvironmentType_2D),
-          offset{0.0f, 0.0f} {
+          offset{0.0f, 0.0f},
+          aliasTable() {
     }
 
     explicit Environment(const torch::Tensor& environment);
+    Environment(const torch::Tensor& environment, const torch::Tensor& aliasTable);
 #endif
 
     const float4* data; ///< Optional environment, stored as HxWx4 float data.
@@ -32,4 +56,5 @@ struct Environment {
     int height;
     int type; ///< EnvironmentType_2D or EnvironmentType_Cube.
     float2 offset;
+    EnvAliasTable aliasTable;
 };

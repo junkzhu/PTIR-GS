@@ -52,6 +52,10 @@ extern "C" __global__ void __raygen__rg() {
     if (!path.currentRayPayload.interaction.valid) { return; }
 #endif
 
+#ifdef ENABLE_MIS
+    sampleNee(path, sampler);
+#endif
+
     for (unsigned int depth = 0; depth < params.maxBounces && path.active; ++depth) {
         accumulateLightContributionBwd(path, params);
 

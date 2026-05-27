@@ -33,7 +33,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 import threedgrut.datasets as datasets
 from threedgrut.datasets.protocols import BoundedMultiViewDataset
 from threedgrut.datasets.utils import DEFAULT_DEVICE, MultiEpochsDataLoader, PointCloud
-from threedgrut.model.environment import Environment, save_environment_exr
+from threedgrut.model.environment import EnvAliasTable, Environment, save_environment_exr
 from threedgrut.model.losses import (
     depth_distortion_loss,
     edge_aware_smoothness_loss,
@@ -125,6 +125,8 @@ class Trainer3DGRUT:
         """ Device used for training and visualizations """
         self.environment = None
         """ Optional environment map loaded from conf.environment. """
+        self.environment_alias_table: Optional[EnvAliasTable] = None
+        """ Optional environment alias table for PTIR MIS. """
         self.global_step = 0
         """ Current global iteration of the trainer """
         self.n_iterations = conf.n_iterations
@@ -220,6 +222,22 @@ class Trainer3DGRUT:
         )
         self.model.optimize_environment = self.environment.optimize_environment
         self.model.environment = self.environment.get_environment_parameter()
+        if self.conf.render.method == "3dgptir" and self.conf.render.enable_mis:
+            self.rebuild_environment_alias_table(log=True)
+
+    @torch.no_grad()
+    def rebuild_environment_alias_table(self, log: bool = False) -> None:
+        if self.environment is None:
+            self.environment_alias_table = None
+        else:
+            self.environment_alias_table = self.environment.build_alias_table()
+            if log:
+                logger.info(
+                    "🌐 Built PTIR MIS environment alias table "
+                    f"({self.environment_alias_table.width}x{self.environment_alias_table.height}, "
+                    f"{self.environment_alias_table.numCells} cells)"
+                )
+        self.model.environment_alias_table = self.environment_alias_table
 
     def restore_environment_from_checkpoint(self, checkpoint: dict, conf: DictConfig) -> None:
         environment_state = checkpoint.get("environment_state")
@@ -230,6 +248,11 @@ class Trainer3DGRUT:
         self.environment.configure_optimization(bool(OmegaConf.select(conf, "model.optimize_environment", default=False)))
         self.model.optimize_environment = self.environment.optimize_environment
         self.model.environment = self.environment.get_environment_parameter()
+        if self.conf.render.method == "3dgptir" and self.conf.render.enable_mis:
+            self.rebuild_environment_alias_table(log=True)
+        else:
+            self.environment_alias_table = None
+            self.model.environment_alias_table = None
 
     def init_densification_and_pruning_strategy(self, conf: DictConfig) -> None:
         """Set pre-train / post-train iteration logic. i.e. densification and pruning"""
@@ -1405,6 +1428,16 @@ class Trainer3DGRUT:
         # Increment the global step
         global_step += 1
         self.global_step = global_step
+        if (
+            self.environment is not None
+            and self.conf.render.method == "3dgptir"
+            and self.conf.render.enable_mis
+            and self.conf.model.optimize_environment
+            and self.conf.model.alias_table_update_frequency > 0
+            and global_step % self.conf.model.alias_table_update_frequency == 0
+        ):
+            with torch.cuda.nvtx.range(f"train_{global_step - 1}_environment_alias_table"):
+                self.rebuild_environment_alias_table()
 
         # Compute metrics
         batch_metrics = self.get_metrics(

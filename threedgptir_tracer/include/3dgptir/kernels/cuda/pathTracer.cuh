@@ -36,6 +36,12 @@ struct RayHit {
 };
 using RayPayload = RayHit[PipelineParameters::MaxNumHitPerTrace];
 
+static __device__ __forceinline__ float misWeight(float pdfA, float pdfB) {
+    const float a2 = pdfA * pdfA;
+    const float b2 = pdfB * pdfB;
+    return a2 / fmaxf(a2 + b2, 1e-6f);
+}
+
 static __device__ __inline__ float2 intersectAABB(const OptixAabb& aabb, const Ray& ray) {
     const float3 t0   = (make_float3(aabb.minX, aabb.minY, aabb.minZ) - ray.origin) / ray.direction;
     const float3 t1   = (make_float3(aabb.maxX, aabb.maxY, aabb.maxZ) - ray.origin) / ray.direction;
@@ -120,6 +126,92 @@ static __device__ __forceinline__ bool isSelfOcclusionHit(
     return dot(shadingNormal, ray.direction) > kSelfOcclusionNormalDotThreshold;
 }
 
+template <int ParticleKernelDegree = 4, bool SurfelPrimitive = false>
+static __device__ __forceinline__ float shadowHitAlpha(
+    const Ray& ray,
+    const int32_t particleIdx) {
+    float3 particlePosition;
+    float3 particleScale;
+    float33 particleRotation;
+    float particleDensity;
+    fetchParticleDensity(
+        particleIdx,
+        params.particleDensity,
+        particlePosition,
+        particleScale,
+        particleRotation,
+        particleDensity);
+
+    const float3 giscl   = make_float3(1.0f / particleScale.x, 1.0f / particleScale.y, 1.0f / particleScale.z);
+    const float3 gposc   = ray.origin - particlePosition;
+    const float3 gposcr  = gposc * particleRotation;
+    const float3 gro     = giscl * gposcr;
+    const float3 rayDirR = ray.direction * particleRotation;
+    const float3 grdu    = giscl * rayDirR;
+    const float3 grd     = safe_normalize(grdu);
+    const float3 gcrod   = SurfelPrimitive ? gro + grd * -gro.z / grd.z : cross(grd, gro);
+    const float grayDist = dot(gcrod, gcrod);
+
+    const float gres = particleResponse<ParticleKernelDegree>(grayDist);
+    const float alpha = fminf(0.99f, gres * particleDensity);
+    return (gres > params.hitMinGaussianResponse && alpha > params.alphaMinThreshold) ? alpha : 0.0f;
+}
+
+template <bool EnableSelfOcclusionRejection = true>
+static __device__ __inline__ bool traceShadowMonteCarloOccluded(
+    const Ray& ray,
+    Sampler& sampler,
+    const float tmin = 0.0f,
+    const float tmax = RayHit::InfiniteDistance) {
+    constexpr float epsT = 1e-9f;
+    const float2 minMaxT = intersectAABB(params.aabb, ray);
+    float startT = fmaxf(tmin, minMaxT.x - epsT);
+    const float endT = fminf(tmax, minMaxT.y) + epsT;
+    if (startT >= endT) {
+        return false;
+    }
+
+    RayPayload hitPayload;
+
+    while (startT < endT) {
+        trace(hitPayload, ray, startT + epsT, endT);
+        if (hitPayload[0].particleId == RayHit::InvalidParticleId) {
+            break;
+        }
+
+        float batchEndT = startT;
+#pragma unroll
+        for (int i = 0; i < PipelineParameters::MaxNumHitPerTrace; ++i) {
+            const RayHit rayHit = hitPayload[i];
+            if (rayHit.particleId == RayHit::InvalidParticleId) {
+                break;
+            }
+            if (rayHit.distance > endT) {
+                break;
+            }
+
+            batchEndT = fmaxf(batchEndT, rayHit.distance);
+            if (EnableSelfOcclusionRejection && isSelfOcclusionHit(rayHit, ray, params.particleShadingNormal)) {
+                continue;
+            }
+
+            const float alpha = shadowHitAlpha<PipelineParameters::ParticleKernelDegree, PipelineParameters::SurfelPrimitive>(
+                ray,
+                rayHit.particleId);
+            if (alpha > 0.0f && sampler.next_1d() < alpha) {
+                return true;
+            }
+        }
+
+        if (batchEndT <= startT) {
+            break;
+        }
+        startT = batchEndT;
+    }
+
+    return false;
+}
+
 template <bool EnableSelfOcclusionRejection>
 static __device__ __inline__ void rayIntersect(
     const Ray& ray,
@@ -129,7 +221,15 @@ static __device__ __inline__ void rayIntersect(
     const float2 minMaxT = intersectAABB(params.aabb, ray);
     RayPayload hitPayload;
 
+#ifdef ENABLE_MIS
+    const float scatterPdf = payload.scatterPdf;
+    const float lightPdf   = payload.lightPdf;
+#endif
     payload = rayPayload(ray, fmaxf(0.0f, minMaxT.x - epsT));
+#ifdef ENABLE_MIS
+    payload.scatterPdf = scatterPdf;
+    payload.lightPdf   = lightPdf;
+#endif
     float integratedDepth = 0.f;
     Material integratedMaterial;
     float3 integratedShadingnormal = make_float3(0.f);
@@ -295,42 +395,129 @@ static __device__ __inline__ void sampleBrdfNextDirection(
     const Interaction currentInteraction = path.currentRayPayload.interaction;
 
     float3 nextRayDirection = currentRay.direction;
-    const float3 brdf = sampled_fast_brdf(
+    float scatterPdf = 0.0f;
+    const float3 brdfThroughput = sample_material_fast_brdf_throughput(
         currentRay.direction,
         sampler,
         currentInteraction,
-        nextRayDirection);
+        nextRayDirection,
+        scatterPdf);
 
-    path.pathThroughput *= brdf;
+    path.pathThroughput *= brdfThroughput;
     Ray nextRay(currentInteraction.position + safe_normalize(nextRayDirection) * kSelfOcclusionRayOriginOffset, nextRayDirection);
     path.currentRayPayload = rayPayload(nextRay, 0.0f);
+#ifdef ENABLE_MIS
+    path.currentRayPayload.scatterPdf = scatterPdf;
+    path.currentRayPayload.lightPdf = environmentAliasPdf(nextRay.direction);
+#endif
 }
+
+static __device__ __inline__ void sampleNee(
+    pathPayload& path,
+    Sampler& sampler) {
+    const Interaction currentInteraction = path.currentRayPayload.interaction;
+
+    float lightPdf = 0.0f;
+    float scatterPdf = 0.0f;
+    const float3 lightDirection = sampleEnvironmentAliasDirection(sampler, lightPdf);
+    const float3 brdfTimesCos = eval_material_fast_brdf_light_sample(
+        path.currentRayPayload.ray.direction,
+        currentInteraction,
+        lightDirection,
+        scatterPdf);
+    const Ray lightRay(
+        currentInteraction.position + lightDirection * kSelfOcclusionRayOriginOffset,
+        lightDirection);
+    path.emitterRayPayload = rayPayload(lightRay, 0.0f);
+
+    path.emitterRayPayload.lightPdf = lightPdf;
+    path.emitterRayPayload.scatterPdf = scatterPdf;
+    path.emitterRayPayload.contribution = path.pathThroughput * brdfTimesCos * getBackgroundColor(lightDirection) / fmaxf(lightPdf, 1e-6f);
+}
+
+#ifdef ENABLE_MIS
+template <typename PipelineParams>
+static __device__ __inline__ void accumulateNeeGradBwd(
+    pathPayload& path,
+    const Ray& currentRay,
+    const Interaction& currentInteraction,
+    PipelineParams& pipelineParams) {
+    if (path.numBounces != 1u) {
+        return;
+    }
+
+    float scatterPdf = 0.0f;
+    const float3 lightDirection = path.emitterRayPayload.ray.direction;
+    const FastBrdfValueGrad brdfTimesCos = eval_material_fast_brdf_light_sample_with_grads(
+        currentRay.direction,
+        currentInteraction,
+        lightDirection,
+        scatterPdf);
+
+    const float lightSideMis = misWeight(
+        path.emitterRayPayload.lightPdf,
+        path.emitterRayPayload.scatterPdf);
+    const float neeScale = lightSideMis / fmaxf(path.emitterRayPayload.lightPdf, 1e-6f);
+
+    const float3 environmentGrad = path.accumulatedLightingGrad * path.pathThroughput * brdfTimesCos.value * neeScale;
+    const float3 background = getBackgroundColorBwd(lightDirection, environmentGrad, pipelineParams);
+    const float3 dLoss_dBrdf = path.accumulatedLightingGrad * path.pathThroughput * background * neeScale;
+
+    path.currentRayPayload.interaction.materialGrad.dAlbedo += dLoss_dBrdf * brdfTimesCos.dBrdf_dAlbedo;
+    path.currentRayPayload.interaction.materialGrad.dRoughness += dot(dLoss_dBrdf, brdfTimesCos.dBrdf_dRoughness);
+#ifdef ENABLE_METALLIC
+    path.currentRayPayload.interaction.materialGrad.dMetallic += dot(dLoss_dBrdf, brdfTimesCos.dBrdf_dMetallic);
+#endif
+}
+#endif
 
 
 template <typename PipelineParams>
 static __device__ __inline__ void sampleBrdfNextDirectionBwd(
     pathPayload& path,
     Sampler& sampler,
-    const PipelineParams& pipelineParams) {
+    PipelineParams& pipelineParams) {
     const Ray currentRay = path.currentRayPayload.ray;
     const Interaction currentInteraction = path.currentRayPayload.interaction;
 
     float3 nextRayDirection = currentRay.direction;
-    const FastBrdfValueGrad brdf = sampled_fast_brdf_with_grads(
+    float scatterPdf = 0.0f;
+    const FastBrdfValueGrad brdfThroughput = sample_material_fast_brdf_throughput_with_grads(
         currentRay.direction,
         sampler,
         currentInteraction,
-        nextRayDirection);
+        nextRayDirection,
+        scatterPdf);
 
-    const float3 dLoss_dBrdfNumerator = path.accumulatedLightingGrad * path.accumulatedLighting;
+#ifdef ENABLE_MIS
+    const float lightPdf = environmentAliasPdf(nextRayDirection);
+    const float3 nextPathThroughput = path.pathThroughput * brdfThroughput.value;
+    const float nextThroughputMax = fmaxf(nextPathThroughput.x, fmaxf(nextPathThroughput.y, nextPathThroughput.z));
+    const bool firstBounceNeeActive = path.numBounces == 1u && nextThroughputMax >= 1e-4f;
+    if (firstBounceNeeActive) {
+        accumulateNeeGradBwd(path, currentRay, currentInteraction, pipelineParams);
+    }
+#endif
+
+    float3 brdfDependentLighting = path.accumulatedLighting;
+#ifdef ENABLE_MIS
+    if (firstBounceNeeActive) {
+        const float lightSideMis = misWeight(
+            path.emitterRayPayload.lightPdf,
+            path.emitterRayPayload.scatterPdf);
+        brdfDependentLighting -= path.emitterRayPayload.contribution * lightSideMis;
+    }
+#endif
+
+    const float3 dLoss_dBrdfNumerator = path.accumulatedLightingGrad * brdfDependentLighting;
     const float3 dLoss_dBrdf = make_float3(
-        brdf.value.x > FastBrdfEps ? dLoss_dBrdfNumerator.x / brdf.value.x : 0.0f,
-        brdf.value.y > FastBrdfEps ? dLoss_dBrdfNumerator.y / brdf.value.y : 0.0f,
-        brdf.value.z > FastBrdfEps ? dLoss_dBrdfNumerator.z / brdf.value.z : 0.0f);
-    path.currentRayPayload.interaction.materialGrad.dAlbedo += dLoss_dBrdf * brdf.dBrdf_dAlbedo;
-    path.currentRayPayload.interaction.materialGrad.dRoughness += dot(dLoss_dBrdf, brdf.dBrdf_dRoughness);
+        brdfThroughput.value.x > FastBrdfEps ? dLoss_dBrdfNumerator.x / brdfThroughput.value.x : 0.0f,
+        brdfThroughput.value.y > FastBrdfEps ? dLoss_dBrdfNumerator.y / brdfThroughput.value.y : 0.0f,
+        brdfThroughput.value.z > FastBrdfEps ? dLoss_dBrdfNumerator.z / brdfThroughput.value.z : 0.0f);
+    path.currentRayPayload.interaction.materialGrad.dAlbedo += dLoss_dBrdf * brdfThroughput.dBrdf_dAlbedo;
+    path.currentRayPayload.interaction.materialGrad.dRoughness += dot(dLoss_dBrdf, brdfThroughput.dBrdf_dRoughness);
 #ifdef ENABLE_METALLIC
-    path.currentRayPayload.interaction.materialGrad.dMetallic += dot(dLoss_dBrdf, brdf.dBrdf_dMetallic);
+    path.currentRayPayload.interaction.materialGrad.dMetallic += dot(dLoss_dBrdf, brdfThroughput.dBrdf_dMetallic);
 #endif
 
     if (path.numBounces > 1u) {
@@ -349,9 +536,13 @@ static __device__ __inline__ void sampleBrdfNextDirectionBwd(
             pipelineParams);
     }
 
-    path.pathThroughput *= brdf.value;
+    path.pathThroughput *= brdfThroughput.value;
     Ray nextRay(currentInteraction.position + safe_normalize(nextRayDirection) * kSelfOcclusionRayOriginOffset, nextRayDirection);
     path.currentRayPayload = rayPayload(nextRay, 0.0f);
+#ifdef ENABLE_MIS
+    path.currentRayPayload.scatterPdf = scatterPdf;
+    path.currentRayPayload.lightPdf = lightPdf;
+#endif
 }
 
 static __device__ __inline__ void writePrimaryRayOutputs(
