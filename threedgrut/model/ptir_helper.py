@@ -29,6 +29,23 @@ if TYPE_CHECKING:
     from threedgrut.model.model import MixtureOfGaussians
 
 
+def srgb_to_linear(image: torch.Tensor) -> torch.Tensor:
+    """Convert sRGB values in [0, 1] to linear RGB."""
+    out = torch.empty_like(image)
+    linear = image <= 0.04045
+    out[linear] = image[linear] / 12.92
+    out[~linear] = ((image[~linear] + 0.055) / 1.055).pow(2.4)
+    return out
+
+
+def linear_to_srgb(image: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(image)
+    linear = image <= 0.0031308
+    out[linear] = 12.92 * image[linear]
+    out[~linear] = 1.055 * image[~linear].pow(1.0 / 2.4) - 0.055
+    return out
+
+
 def _first_tensor_options(*sequences: Sequence[Any]) -> tuple[torch.device, torch.dtype]:
     for sequence in sequences:
         for value in sequence:

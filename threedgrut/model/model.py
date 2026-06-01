@@ -30,6 +30,7 @@ from threedgrut.datasets.protocols import Batch
 from threedgrut.datasets.utils import read_colmap_points3D_text, read_next_bytes
 from threedgrut.export import PLYExporter
 from threedgrut.export.base import ExportableModel
+from threedgrut.model.environment import Environment
 from threedgrut.model.geometry import k_nearest_neighbors, nearest_neighbor_dist_cpuKD
 from threedgrut.optimizers import SelectiveAdam
 from threedgrut.utils.logger import logger
@@ -106,7 +107,11 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         return self.material_metallic_activation(self.material_metallic)
 
     def get_environment(self) -> torch.Tensor | None:
-        if self.environment is not None and self.optimize_environment:
+        if (
+            self.environment is not None
+            and self.optimize_environment
+            and self.environment_parameterization == Environment.LOG_ENVIRONMENT_PARAMETERIZATION
+        ):
             return torch.exp(self.environment)
         return self.environment
 
@@ -245,6 +250,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         self.environment = None
         self.environment_alias_table = None
         self.optimize_environment = False
+        self.environment_parameterization = Environment.LINEAR_ENVIRONMENT_PARAMETERIZATION
 
         # Check if we would like to do progressive training
         self.feature_type = self.conf.model.progressive_training.feature_type
@@ -753,7 +759,7 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         return torch.nn.Parameter(self.material_albedo_activation_inv(albedo))
 
     def _default_material_roughness(self, num_gaussians: int, dtype: torch.dtype) -> torch.nn.Parameter:
-        roughness = torch.full((num_gaussians, 1), 0.9, dtype=dtype, device=self.device)
+        roughness = torch.full((num_gaussians, 1), 0.5, dtype=dtype, device=self.device)
         return torch.nn.Parameter(self.material_roughness_activation_inv(roughness))
 
     def _default_material_metallic(self, num_gaussians: int, dtype: torch.dtype) -> torch.nn.Parameter:

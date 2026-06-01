@@ -44,6 +44,7 @@ from threedgrut.model.losses import (
     ssim,
 )
 from threedgrut.model.model import MixtureOfGaussians
+from threedgrut.model.ptir_helper import linear_to_srgb, srgb_to_linear
 from threedgrut.optimizers import SelectiveAdam
 from threedgrut.render import Renderer
 from threedgrut.strategy.base import BaseStrategy
@@ -213,14 +214,17 @@ class Trainer3DGRUT:
     def init_environment(self, conf: DictConfig) -> None:
         env_path = OmegaConf.select(conf, "environment.path", default=None)
         env_type = OmegaConf.select(conf, "environment.type", default="2d")
+        env_parameterization = OmegaConf.select(conf, "environment.parameterization", default="linear")
         optimize_environment = bool(OmegaConf.select(conf, "model.optimize_environment", default=False))
         self.environment = Environment(
             path=env_path,
             device=self.device,
             environment_type=env_type,
             optimize_environment=optimize_environment,
+            parameterization=env_parameterization,
         )
         self.model.optimize_environment = self.environment.optimize_environment
+        self.model.environment_parameterization = self.environment.environment_parameterization
         self.model.environment = self.environment.get_environment_parameter()
         if self.conf.render.method == "3dgptir" and self.conf.render.enable_mis:
             self.rebuild_environment_alias_table(log=True)
@@ -247,6 +251,7 @@ class Trainer3DGRUT:
         self.environment.load_state_dict(environment_state)
         self.environment.configure_optimization(bool(OmegaConf.select(conf, "model.optimize_environment", default=False)))
         self.model.optimize_environment = self.environment.optimize_environment
+        self.model.environment_parameterization = self.environment.environment_parameterization
         self.model.environment = self.environment.get_environment_parameter()
         if self.conf.render.method == "3dgptir" and self.conf.render.enable_mis:
             self.rebuild_environment_alias_table(log=True)
@@ -769,13 +774,9 @@ class Trainer3DGRUT:
         Returns:
             losses: dictionary of loss terms computed for current batch.
         """
-        rgb_gt_srgb = gpu_batch.rgb_gt
-        rgb_gt = torch.where(
-            rgb_gt_srgb <= 0.04045,
-            rgb_gt_srgb / 12.92,
-            ((rgb_gt_srgb + 0.055) / 1.055) ** 2.4,
-        )
-        rgb_pred = outputs["pred_pbr"]
+        rgb_gt = gpu_batch.rgb_gt
+        rgb_pred = linear_to_srgb(outputs["pred_pbr"])
+
         mask = gpu_batch.mask
         gradient_mask = gpu_batch.gradient_mask
 

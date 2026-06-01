@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -203,6 +204,9 @@ def draw_psnr_sparkline_on_image(image: np.ndarray, psnr_history: list[float]) -
 class TrainingVisualizer:
     """Save periodic training visualizations to disk."""
 
+    PBR_ALBEDO_ERROR_MAX = 5e-2
+    ROUGHNESS_ERROR_MAX = 1e-1
+
     def __init__(
         self,
         output_dir: str | os.PathLike,
@@ -213,11 +217,13 @@ class TrainingVisualizer:
         self.frequency = int(frequency)
         self.enabled = self.frequency > 0
         self.output_dir = Path(output_dir) / "visualizations"
+        self.metric_history_path = self.output_dir / "metric_history.json"
         self.has_normal_gt = bool(has_normal_gt)
         self.show_pbr_material = bool(show_pbr_material)
         self.pbr_psnr_tracker = PSNRTracker()
         self.albedo_psnr_tracker = PSNRTracker()
         self.roughness_mse_tracker = ScalarHistoryTracker()
+        self._load_metric_histories()
         self._draw_pbr_psnr_history = False
         self._draw_albedo_psnr_history = False
         self._draw_roughness_mse_history = False
@@ -266,12 +272,51 @@ class TrainingVisualizer:
 
         image = self._concat_rows(rows)
         torchvision.utils.save_image(image, self.output_dir / f"{step:05d}.png")
+        self._save_metric_histories()
         self._reset_draw_metric_history_flags()
 
     def _reset_draw_metric_history_flags(self) -> None:
         self._draw_pbr_psnr_history = False
         self._draw_albedo_psnr_history = False
         self._draw_roughness_mse_history = False
+
+    def _load_metric_histories(self) -> None:
+        if not self.metric_history_path.is_file():
+            return
+
+        try:
+            history = json.loads(self.metric_history_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return
+
+        self.pbr_psnr_tracker.history = self._load_metric_history_values(history.get("pbr_psnr"))
+        self.albedo_psnr_tracker.history = self._load_metric_history_values(history.get("albedo_psnr"))
+        self.roughness_mse_tracker.history = self._load_metric_history_values(history.get("roughness_mse"))
+
+    def _save_metric_histories(self) -> None:
+        history = {
+            "pbr_psnr": self.pbr_psnr_tracker.history,
+            "albedo_psnr": self.albedo_psnr_tracker.history,
+            "roughness_mse": self.roughness_mse_tracker.history,
+        }
+        try:
+            self.metric_history_path.write_text(json.dumps(history, indent=2) + "\n")
+        except OSError:
+            logger.warning(f"Failed to save metric history to: {self.metric_history_path}")
+
+    @staticmethod
+    def _load_metric_history_values(values: object) -> list[float]:
+        if not isinstance(values, list):
+            return []
+        history = []
+        for value in values:
+            try:
+                value_float = float(value)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(value_float):
+                history.append(value_float)
+        return history
 
     def _update_pbr_psnr(self, outputs: dict, batch: Optional[object]) -> None:
         if batch is None:
@@ -538,6 +583,7 @@ class TrainingVisualizer:
             gt_attr="material_albedo_gt",
             material_slice=slice(0, 3),
             reference=reference,
+            fixed_max_error=self.PBR_ALBEDO_ERROR_MAX,
         )
         roughness_err_image = self._build_material_error_image(
             outputs,
@@ -545,6 +591,7 @@ class TrainingVisualizer:
             gt_attr="material_roughness_gt",
             material_slice=slice(3, 4),
             reference=reference,
+            fixed_max_error=self.ROUGHNESS_ERROR_MAX,
         )
         blank_image = torch.zeros_like(err_image)
         err_image = self._draw_metric_history_on_batch(
@@ -583,7 +630,7 @@ class TrainingVisualizer:
 
         pred_pbr_srgb = self._linear_to_srgb(pred_pbr)
         err_map = ((pred_pbr_srgb.permute(0, 2, 3, 1) - rgb_gt.permute(0, 2, 3, 1)) ** 2).mean(dim=-1)
-        err_image = self._error_batch_to_image(err_map)
+        err_image = self._error_batch_to_image(err_map, fixed_max_error=self.PBR_ALBEDO_ERROR_MAX)
         return self._resize_like(err_image, reference)
 
     def _build_material_error_image(
@@ -593,6 +640,7 @@ class TrainingVisualizer:
         gt_attr: str,
         material_slice: slice,
         reference: torch.Tensor,
+        fixed_max_error: Optional[float] = None,
     ) -> torch.Tensor:
         if batch is None:
             return torch.zeros_like(reference)
@@ -615,7 +663,7 @@ class TrainingVisualizer:
             pred = self._scale_albedo_to_gt(pred, gt)
 
         err_map = ((pred - gt) ** 2).mean(dim=-1)
-        err_image = self._error_batch_to_image(err_map)
+        err_image = self._error_batch_to_image(err_map, fixed_max_error=fixed_max_error)
         return self._resize_like(err_image, reference)
 
     def _scale_albedo_to_gt(self, albedo: torch.Tensor, albedo_gt: torch.Tensor) -> torch.Tensor:

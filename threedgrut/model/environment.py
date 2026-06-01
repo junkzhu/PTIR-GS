@@ -252,7 +252,7 @@ def environment_tensor_to_rgb_numpy(environment: torch.Tensor) -> np.ndarray:
         raise ValueError(f"Environment must have shape [H, W, C>=3], got {tuple(environment.shape)}")
 
     rgb = environment[..., :3].detach().cpu().numpy()
-    rgb = np.maximum(np.nan_to_num(rgb, nan=0.0, neginf=0.0), 0.0)
+    rgb = np.nan_to_num(rgb, nan=0.0, posinf=0.0, neginf=0.0)
     return rgb.astype(np.float32, copy=False)
 
 
@@ -271,8 +271,9 @@ class Environment:
     This is the lightweight model-side version of the playground environment
     helper. It intentionally does not do tonemapping; loaded HDR/EXR values are
     kept linear and only padded with an alpha channel for CUDA texture upload.
-    When optimization is enabled, ``self.environment`` stores log-radiance
-    parameters and ``get_environment()`` returns the exp-activated radiance.
+    When log-exp optimization is enabled, ``self.environment`` stores
+    log-radiance parameters and ``get_environment()`` returns exp-activated
+    radiance. Linear optimization stores and returns the texels directly.
     """
 
     FIXED_ENVIRONMENT_OPTIONS = ["Model-Background", "Black", "White"]
@@ -299,11 +300,13 @@ class Environment:
         device: Optional[torch.device | str] = None,
         environment_type: str = "2d",
         optimize_environment: bool = False,
+        parameterization: str = LINEAR_ENVIRONMENT_PARAMETERIZATION,
     ):
         self.device = device
         self.path = path
         self.folder = None
         self.environment_type = self._normalize_environment_type(environment_type)
+        self.environment_parameterization = self._normalize_environment_parameterization(parameterization)
         self.optimize_environment = bool(optimize_environment)
         self.intensity = 1.0
 
@@ -326,18 +329,25 @@ class Environment:
     def _internal_to_actual(environment: torch.Tensor) -> torch.Tensor:
         return torch.exp(environment)
 
+    def _uses_log_parameterization(self) -> bool:
+        return self.environment_parameterization == self.LOG_ENVIRONMENT_PARAMETERIZATION
+
     def _as_environment_tensor(self, environment: torch.Tensor) -> torch.Tensor:
         tensor = torch.as_tensor(environment, dtype=torch.float32, device=self.device).contiguous()
         if tensor.dim() != 3 or tensor.size(-1) != 4:
             raise ValueError(f"environment must have shape [H, W, 4], got {tuple(tensor.shape)}")
         return tensor
 
-    def _set_environment_parameter(self, environment: torch.Tensor) -> None:
+    def _set_environment_parameter(self, environment: torch.Tensor, parameterization: Optional[str] = None) -> None:
+        if parameterization is not None:
+            self.environment_parameterization = self._normalize_environment_parameterization(parameterization)
         tensor = self._as_environment_tensor(environment)
         if self.optimize_environment:
             self.environment = torch.nn.Parameter(tensor.detach().clone(), requires_grad=True)
-        else:
+        elif self._uses_log_parameterization():
             self.environment = self._internal_to_actual(tensor).detach()
+        else:
+            self.environment = tensor.detach()
 
     def _set_environment_tensor(self, environment: Optional[torch.Tensor]) -> None:
         if environment is None:
@@ -345,8 +355,10 @@ class Environment:
             return
 
         tensor = self._as_environment_tensor(environment)
-        if self.optimize_environment:
+        if self.optimize_environment and self._uses_log_parameterization():
             tensor = self._actual_to_internal(tensor)
+            self.environment = torch.nn.Parameter(tensor.detach().clone(), requires_grad=True)
+        elif self.optimize_environment:
             self.environment = torch.nn.Parameter(tensor.detach().clone(), requires_grad=True)
         else:
             self.environment = tensor.detach()
@@ -364,6 +376,14 @@ class Environment:
             raise ValueError(
                 f"environment_type must be one of {cls.ENVIRONMENT_TYPE_OPTIONS}, got '{environment_type}'."
             )
+        return normalized
+
+    @classmethod
+    def _normalize_environment_parameterization(cls, parameterization: str) -> str:
+        normalized = str(parameterization).lower()
+        options = (cls.LINEAR_ENVIRONMENT_PARAMETERIZATION, cls.LOG_ENVIRONMENT_PARAMETERIZATION)
+        if normalized not in options:
+            raise ValueError(f"environment.parameterization must be one of {options}, got '{parameterization}'.")
         return normalized
 
     @classmethod
@@ -532,7 +552,7 @@ class Environment:
         environment[..., 3] = 1.0
         return environment
 
-    def init_environment(self, value: float = 1.5) -> torch.Tensor:
+    def init_environment(self, value: float = 0.5) -> torch.Tensor:
         self.path = None
         self.folder = None
         self.current_name = "Initialized"
@@ -565,7 +585,7 @@ class Environment:
     def get_environment(self) -> Optional[torch.Tensor]:
         if self.environment is None:
             return None
-        if self.optimize_environment:
+        if self.optimize_environment and self._uses_log_parameterization():
             return self._internal_to_actual(self.environment)
         return self.environment
 
@@ -597,7 +617,7 @@ class Environment:
             "environment_offset": list(self.environment_offset),
             "environment": None if self.environment is None else self.environment.detach().clone(),
             "environment_parameterization": (
-                self.LOG_ENVIRONMENT_PARAMETERIZATION
+                self.environment_parameterization
                 if self.optimize_environment
                 else self.LINEAR_ENVIRONMENT_PARAMETERIZATION
             ),
@@ -618,11 +638,8 @@ class Environment:
         environment = state_dict.get("environment")
         parameterization = state_dict.get("environment_parameterization", self.LINEAR_ENVIRONMENT_PARAMETERIZATION)
         if environment is None:
+            self.environment_parameterization = self._normalize_environment_parameterization(parameterization)
             self.environment = None
-        elif parameterization == self.LOG_ENVIRONMENT_PARAMETERIZATION:
-            self._set_environment_parameter(environment)
-        elif parameterization == self.LINEAR_ENVIRONMENT_PARAMETERIZATION:
-            self._set_environment_tensor(environment)
         else:
-            raise ValueError(f"Unknown environment parameterization '{parameterization}'.")
+            self._set_environment_parameter(environment, parameterization)
         self._hdr_data = None
