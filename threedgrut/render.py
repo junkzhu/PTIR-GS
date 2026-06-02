@@ -20,11 +20,13 @@ from pathlib import Path
 import numpy as np
 import torch
 import torchvision
+from omegaconf import OmegaConf
 from torchmetrics import PeakSignalNoiseRatio
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 import threedgrut.datasets as datasets
+from threedgrut.model.environment import Environment
 from threedgrut.model.model import MixtureOfGaussians
 from threedgrut.model.ptir_helper import (
     append_ptir_metrics,
@@ -95,6 +97,30 @@ class Renderer:
             image = image.clip(0.0, 1.0)
         torchvision.utils.save_image(image.squeeze(0).permute(2, 0, 1), path)
 
+    @staticmethod
+    def _restore_environment_from_checkpoint(model, conf, checkpoint: dict) -> None:
+        if conf.render.method != "3dgptir" and OmegaConf.select(conf, "environment", default=None) is None:
+            return
+
+        environment = Environment(
+            path=OmegaConf.select(conf, "environment.path", default=None),
+            device=model.device,
+            environment_type=OmegaConf.select(conf, "environment.type", default="2d"),
+            optimize_environment=bool(OmegaConf.select(conf, "model.optimize_environment", default=False)),
+            parameterization=OmegaConf.select(conf, "environment.parameterization", default="linear"),
+        )
+        environment_state = checkpoint.get("environment_state")
+        if environment_state is not None:
+            environment.load_state_dict(environment_state)
+            environment.configure_optimization(bool(OmegaConf.select(conf, "model.optimize_environment", default=False)))
+
+        model.optimize_environment = environment.optimize_environment
+        model.environment_parameterization = environment.environment_parameterization
+        model.environment = environment.get_environment_parameter()
+        model.environment_alias_table = None
+        if conf.render.method == "3dgptir" and conf.render.get("enable_mis", False):
+            model.environment_alias_table = environment.build_alias_table()
+
     def create_test_dataloader(self, conf):
         """Create the test dataloader for the given configuration."""
         from threedgrut.datasets.utils import configure_dataloader_for_platform
@@ -149,6 +175,7 @@ class Renderer:
             model = MixtureOfGaussians(conf)
             # Initialize the parameters from checkpoint
             model.init_from_checkpoint(checkpoint, setup_optimizer=False)
+        cls._restore_environment_from_checkpoint(model, conf, checkpoint)
         model.build_acc()
 
         # Load post-processing if present in checkpoint
