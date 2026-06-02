@@ -755,11 +755,11 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
         num_gaussians: int,
         dtype: torch.dtype,
     ) -> torch.nn.Parameter:
-        albedo = torch.full((num_gaussians, 3), 0.5, dtype=dtype, device=self.device)
+        albedo = torch.full((num_gaussians, 3), 0.1, dtype=dtype, device=self.device)
         return torch.nn.Parameter(self.material_albedo_activation_inv(albedo))
 
     def _default_material_roughness(self, num_gaussians: int, dtype: torch.dtype) -> torch.nn.Parameter:
-        roughness = torch.full((num_gaussians, 1), 0.5, dtype=dtype, device=self.device)
+        roughness = torch.full((num_gaussians, 1), 0.6, dtype=dtype, device=self.device)
         return torch.nn.Parameter(self.material_roughness_activation_inv(roughness))
 
     def _default_material_metallic(self, num_gaussians: int, dtype: torch.dtype) -> torch.nn.Parameter:
