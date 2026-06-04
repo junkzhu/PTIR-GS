@@ -22,6 +22,7 @@ import torch
 import torch.utils.cpp_extension
 
 from threedgrut.datasets.protocols import Batch
+from threedgrut.model.ptir_helper import post_processing
 from threedgrut.utils.logger import logger as rich_logger
 from threedgrut.utils.timer import CudaTimer
 
@@ -566,7 +567,7 @@ class Tracer:
         if self.frame_timer is not None:
             self.timings["forward_render"] = self.frame_timer.timing()
 
-        return {
+        outputs = {
             "pred_rgb": pred_rgb,
             "pred_opacity": pred_opacity,
             "pred_dist": pred_dist,
@@ -582,3 +583,4 @@ class Tracer:
             "frame_time_ms": self.frame_timer.timing() if self.frame_timer is not None else 0.0,
             "mog_visibility": mog_visibility,
         }
+        return post_processing(outputs, gpu_batch)

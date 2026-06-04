@@ -46,6 +46,75 @@ def linear_to_srgb(image: torch.Tensor) -> torch.Tensor:
     return out
 
 
+PBR_GT_MASK_APPLIED_KEY = "_pbr_gt_mask_applied"
+PBR_GT_MASK_OUTPUT_KEYS = (
+    "pred_pbr",
+    "pred_direct",
+    "pred_indirect",
+    "pred_shadingnormal",
+    "pred_material",
+)
+
+
+def apply_gt_mask_to_tensor(tensor: torch.Tensor | None, mask: torch.Tensor | None) -> torch.Tensor | None:
+    """Apply an NHWC foreground GT mask to an image-like tensor."""
+    if tensor is None:
+        return None
+    if mask is None:
+        return tensor
+    if tensor.ndim != 4:
+        return tensor
+
+    mask = mask.detach().to(device=tensor.device, dtype=tensor.dtype).clamp(0.0, 1.0)
+    if mask.ndim == 2:
+        mask = mask[None, :, :, None]
+    elif mask.ndim == 3:
+        if mask.shape[-1] == 1 and mask.shape[:2] == tensor.shape[1:3]:
+            mask = mask.unsqueeze(0)
+        else:
+            mask = mask.unsqueeze(-1)
+    elif mask.ndim != 4:
+        raise ValueError(f"GT mask must be 2D, 3D, or 4D, got {mask.ndim}D")
+
+    if mask.shape[-1] != 1:
+        mask = mask[..., :1]
+
+    if mask.shape[0] == 1 and tensor.shape[0] != 1:
+        mask = mask.expand(tensor.shape[0], -1, -1, -1)
+
+    if mask.shape[:3] != tensor.shape[:3]:
+        raise ValueError(f"GT mask shape {tuple(mask.shape)} is not compatible with {tuple(tensor.shape)}")
+
+    return tensor * mask
+
+
+def post_processing(outputs: dict, gpu_batch) -> dict:
+    """Mask PTIR/PBR image outputs with the batch GT foreground mask."""
+    if pbr_gt_mask_was_applied(outputs):
+        return outputs
+
+    mask = getattr(gpu_batch, "mask", None)
+    if mask is None:
+        return outputs
+
+    masked_outputs = dict(outputs)
+    applied = False
+    for key in PBR_GT_MASK_OUTPUT_KEYS:
+        value = outputs.get(key)
+        if value is None:
+            continue
+        masked_outputs[key] = apply_gt_mask_to_tensor(value, mask)
+        applied = True
+
+    if applied:
+        masked_outputs[PBR_GT_MASK_APPLIED_KEY] = True
+    return masked_outputs
+
+
+def pbr_gt_mask_was_applied(outputs: dict) -> bool:
+    return bool(outputs.get(PBR_GT_MASK_APPLIED_KEY, False))
+
+
 def _first_tensor_options(*sequences: Sequence[Any]) -> tuple[torch.device, torch.dtype]:
     for sequence in sequences:
         for value in sequence:
