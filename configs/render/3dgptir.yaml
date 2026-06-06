@@ -15,6 +15,7 @@ visualize_environment: false
 enable_normals: true
 enable_hitcounts: true
 enable_mis: true
+filter_type: atrous #support "none", "atrous"
 enable_metallic: ${model.optimize_material_metallic}
 enable_kernel_timings: false
 max_bounces: 3

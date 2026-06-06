@@ -22,6 +22,7 @@ import torch
 import torch.utils.cpp_extension
 
 from threedgrut.datasets.protocols import Batch
+from threedgrut.model.filters import Filter
 from threedgrut.model.ptir_helper import post_processing
 from threedgrut.utils.logger import logger as rich_logger
 from threedgrut.utils.timer import CudaTimer
@@ -303,6 +304,7 @@ class Tracer:
         self.num_update_bvh = 0
         self._warned_spp_fallback = False
         self._logged_spp_configs = set()
+        self.pred_pbr_filter = Filter(self.conf.render.get("filter_type", "none"))
 
         logger.info(f'🔆 Creating threedgptir Optix tracing pipeline.. Using CUDA path: "{torch.utils.cpp_extension.CUDA_HOME}"')
         torch.zeros(1, device=self.device)  # Create a dummy tensor to force cuda context init
@@ -575,6 +577,11 @@ class Tracer:
 
             pred_dist = pred_dist / pred_opacity
             pred_dist = torch.nan_to_num(pred_dist, 0.0, 0.0)
+
+            pred_pbr = self.pred_pbr_filter(pred_pbr)
+            pred_light = self.pred_pbr_filter(pred_light)
+            pred_direct = self.pred_pbr_filter(pred_direct)
+            pred_indirect = self.pred_pbr_filter(pred_indirect)
 
         if self.frame_timer is not None:
             self.timings["forward_render"] = self.frame_timer.timing()
