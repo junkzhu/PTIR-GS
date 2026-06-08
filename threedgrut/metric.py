@@ -25,7 +25,7 @@ from threedgrut.model.ptir_helper import (
 
 # Existing inverse rendering methods such as R3DG and IRGS use this PSNR convention:
 # compute PSNR separately for each RGB channel, then average the channel results.
-IRGS_PSNR = True
+IRGS_PSNR = False
 
 
 def mse(img1: torch.Tensor, img2: torch.Tensor) -> torch.Tensor:
