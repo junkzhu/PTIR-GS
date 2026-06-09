@@ -727,4 +727,4 @@ class Tracer:
             else 0.0,
             "mog_visibility": mog_visibility,
         }
-        return post_processing(outputs, gpu_batch)
+        return post_processing(outputs, gpu_batch, self.conf.render.visualize_environment)
