@@ -155,6 +155,7 @@ def make(name: str, config, ray_jitter):
                 load_materials=_dataset_split_enabled(
                     config.dataset, "material", "train"
                 ),
+                mask_from_background=config.dataset.get("mask_from_background", None),
             )
             val_dataset = NeRFDataset(
                 config.path,
@@ -164,6 +165,7 @@ def make(name: str, config, ray_jitter):
                 load_materials=_dataset_split_enabled(
                     config.dataset, "material", "val"
                 ),
+                mask_from_background=config.dataset.get("mask_from_background", None),
             )
         case "colmap":
             # Load EXIF exposure data if enabled (shared between train and val)
@@ -333,6 +335,7 @@ def make_test(name: str, config):
                 load_materials=_dataset_split_enabled(
                     config.dataset, "material", "test"
                 ),
+                mask_from_background=config.dataset.get("mask_from_background", None),
             )
         case "colmap":
             # Load EXIF exposure data if enabled

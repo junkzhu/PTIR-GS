@@ -6,17 +6,20 @@ CUDA_DEVICES="0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
-DATA_ROOT="$REPO_ROOT/data/Mipnerf360"
-OUT_DIR="outputs/mipnerf360"
-CONFIG_NAME="apps/colmap_3dgrt.yaml"
-INVERSION_CONFIG_NAME="inversions/colmap_3dgptir.yaml"
+DATA_ROOT="$REPO_ROOT/data/StanfordOrb"
+OUT_DIR="outputs/stanfordorb"
+CONFIG_NAME="apps/nerf_synthetic_3dgrt.yaml"
+INVERSION_CONFIG_NAME="inversions/nerf_synthetic_3dgptir.yaml"
 INVERSION_OUT_DIR=""
 RUN_INVERSION=true
-DATASET_CONFIG="mipnerf360"
+DATASET_CONFIG="stanfordorb"
 FORCE_TRAIN=false
-GLOBAL_DOWNSAMPLE_FACTOR=""
-BACKGROUND_COLOR="white"
-SCENES=(bicycle bonsai counter flowers garden kitchen room stump treehill)
+INITIALIZATION_NUM_GAUSSIANS="50_000"
+INITIALIZATION_XYZ_MAX="0.5"
+INITIALIZATION_XYZ_MIN="-0.5"
+SCENES=(
+    cactus_scene001 gnome_scene003 car_scene002
+)
 EXTRA_ARGS=()
 INVERSION_EXTRA_ARGS=()
 
@@ -26,7 +29,7 @@ Usage: $0 --cuda_device 0,1,2,3 [options] [-- extra hydra args]
 
 Options:
   --cuda_device DEVICES      Comma-separated GPU ids, e.g. 0,1,2,3.
-  --data_root PATH           Mip-NeRF 360 dataset root. Default: $DATA_ROOT
+  --data_root PATH           StanfordORB dataset root. Default: $DATA_ROOT
   --out_dir PATH             Output directory. Default: $OUT_DIR
   --config_name NAME         Hydra config name. Default: $CONFIG_NAME
   --inversion_config_name NAME
@@ -35,17 +38,14 @@ Options:
   --inversion_args "ARGS"    Extra Hydra args only for PTIR inversion.
   --no_inversion             Only run/skip stage1 training; do not run PTIR inversion.
   --dataset_config NAME      Hydra dataset config. Default: $DATASET_CONFIG
-  --scenes "A B C"           Space-separated scene list. Default: ${SCENES[*]}
-  --downsample_factor FACTOR Use one downsample factor for every scene.
-                             Default: 2 for indoor scenes, 4 for outdoor scenes.
+  --scenes "A B C"           Space-separated scene list. Default: all StanfordORB scenes found here.
   --force_train              Run training even if ckpt_last.pt already exists.
   -h, --help                 Show this help.
 
 Examples:
   $0 --cuda_device 0,1,2,3
-  $0 --cuda_device 0 --scenes "garden" -- n_iterations=7000
-  $0 --cuda_device 0 --scenes "garden" --no_inversion
-  $0 --cuda_device 0,1 --downsample_factor 4
+  $0 --cuda_device 0 --scenes "baking_scene001" -- n_iterations=7000
+  $0 --cuda_device 0 --scenes "baking_scene001" --no_inversion
 EOF
 }
 
@@ -89,10 +89,6 @@ while [[ $# -gt 0 ]]; do
             ;;
         --scenes)
             read -r -a SCENES <<< "$2"
-            shift 2
-            ;;
-        --downsample_factor)
-            GLOBAL_DOWNSAMPLE_FACTOR="$2"
             shift 2
             ;;
         --force_train)
@@ -155,24 +151,6 @@ PY
     echo "[$(date '+%F %T')] PTIR native plugin is ready"
 }
 
-scene_downsample_factor() {
-    local scene="$1"
-
-    if [[ -n "$GLOBAL_DOWNSAMPLE_FACTOR" ]]; then
-        echo "$GLOBAL_DOWNSAMPLE_FACTOR"
-        return
-    fi
-
-    case "$scene" in
-        bonsai|counter|kitchen|room)
-            echo "2"
-            ;;
-        *)
-            echo "4"
-            ;;
-    esac
-}
-
 find_latest_checkpoint() {
     local scene="$1"
     local scene_dir="$OUT_DIR/$scene"
@@ -189,7 +167,6 @@ run_inversion() {
     local scene="$1"
     local gpu_id="$2"
     local initialization_path="$3"
-    local data_factor="$4"
     local scene_path="$DATA_ROOT/$scene"
     local log_file="$INVERSION_OUT_DIR/logs/inversion_${scene}.log"
 
@@ -200,8 +177,6 @@ run_inversion() {
         echo "config=$INVERSION_CONFIG_NAME"
         echo "dataset=$DATASET_CONFIG"
         echo "path=$scene_path"
-        echo "downsample_factor=$data_factor"
-        echo "model.background.color=$BACKGROUND_COLOR"
         echo "initialization.path=$initialization_path"
         echo "out_dir=$INVERSION_OUT_DIR"
         echo "experiment_name=${scene}_inversion"
@@ -215,8 +190,6 @@ run_inversion() {
             "out_dir=$INVERSION_OUT_DIR" \
             "experiment_name=${scene}_inversion" \
             "initialization.path=$initialization_path" \
-            "dataset.downsample_factor=$data_factor" \
-            "model.background.color=$BACKGROUND_COLOR" \
             "${INVERSION_EXTRA_ARGS[@]}"
     } > "$log_file" 2>&1
     echo "[$(date '+%F %T')] Finished PTIR inversion scene=$scene on CUDA_VISIBLE_DEVICES=$gpu_id"
@@ -226,7 +199,6 @@ run_scene() {
     local scene="$1"
     local gpu_id="$2"
     local scene_path="$DATA_ROOT/$scene"
-    local data_factor=""
     local log_file="$OUT_DIR/logs/train_${scene}.log"
     local checkpoint_path=""
 
@@ -234,8 +206,6 @@ run_scene() {
         echo "[$(date '+%F %T')] Scene path does not exist, skipping: $scene_path"
         return 0
     fi
-
-    data_factor="$(scene_downsample_factor "$scene")"
 
     checkpoint_path="$(find_latest_checkpoint "$scene" || true)"
     if [[ -n "$checkpoint_path" && "$FORCE_TRAIN" != true ]]; then
@@ -249,8 +219,9 @@ run_scene() {
             echo "config=$CONFIG_NAME"
             echo "dataset=$DATASET_CONFIG"
             echo "path=$scene_path"
-            echo "downsample_factor=$data_factor"
-            echo "model.background.color=$BACKGROUND_COLOR"
+            echo "initialization.num_gaussians=$INITIALIZATION_NUM_GAUSSIANS"
+            echo "initialization.xyz_max=$INITIALIZATION_XYZ_MAX"
+            echo "initialization.xyz_min=$INITIALIZATION_XYZ_MIN"
             echo "out_dir=$OUT_DIR"
             echo "experiment_name=$scene"
             printf 'extra_args=%q ' "${EXTRA_ARGS[@]}"
@@ -260,10 +231,11 @@ run_scene() {
                 --config-name "$CONFIG_NAME" \
                 "dataset=$DATASET_CONFIG" \
                 "path=$scene_path" \
+                "initialization.num_gaussians=$INITIALIZATION_NUM_GAUSSIANS" \
+                "initialization.xyz_max=$INITIALIZATION_XYZ_MAX" \
+                "initialization.xyz_min=$INITIALIZATION_XYZ_MIN" \
                 "out_dir=$OUT_DIR" \
                 "experiment_name=$scene" \
-                "dataset.downsample_factor=$data_factor" \
-                "model.background.color=$BACKGROUND_COLOR" \
                 "${EXTRA_ARGS[@]}"
         } > "$log_file" 2>&1
         echo "[$(date '+%F %T')] Finished training scene=$scene on CUDA_VISIBLE_DEVICES=$gpu_id"
@@ -275,7 +247,7 @@ run_scene() {
             echo "[$(date '+%F %T')] No stage1 checkpoint found for scene=$scene; skipping PTIR inversion."
             return 1
         fi
-        run_inversion "$scene" "$gpu_id" "$checkpoint_path" "$data_factor"
+        run_inversion "$scene" "$gpu_id" "$checkpoint_path"
     fi
 }
 
@@ -298,4 +270,4 @@ for idx in "${!SCENES[@]}"; do
 done
 
 wait
-echo "All Mip-NeRF 360 jobs finished. Logs: $OUT_DIR/logs"
+echo "All StanfordORB jobs finished. Logs: $OUT_DIR/logs"

@@ -599,6 +599,7 @@ class Renderer:
                 "indirect",
                 "light",
                 "pbr",
+                "pbr_gt",
                 "albedo",
                 "albedo_gt",
                 "roughness",
@@ -711,6 +712,10 @@ class Renderer:
                             os.path.join(output_path_ptir_aovs[aov_name], frame_name),
                             linear_to_srgb=True,
                         )
+                self._save_nhwc_image(
+                    rgb_gt_full,
+                    os.path.join(output_path_ptir_aovs["pbr_gt"], frame_name),
+                )
 
                 if pred_material is not None:
                     albedo = pred_material[..., 0:3]

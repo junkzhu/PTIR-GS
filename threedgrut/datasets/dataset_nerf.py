@@ -46,6 +46,7 @@ class NeRFDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         bg_color=None,
         load_normals=False,
         load_materials=False,
+        mask_from_background=None,
     ):
         self.root_dir = path
         self.device = device
@@ -54,6 +55,7 @@ class NeRFDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         self.bg_color = bg_color
         self.load_normals = load_normals
         self.load_materials = load_materials
+        self.mask_from_background = mask_from_background
 
         # Cache for per-worker GPU tensors (thread-local storage)
         self._worker_gpu_cache = {}
@@ -277,11 +279,12 @@ class NeRFDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
     @torch.cuda.nvtx.range("nerf_dataset::_getitem")
     def __getitem__(self, idx) -> dict:
         out_shape = (1, self.image_h, self.image_w, 3)
-        img, alpha = NeRFDataset.__read_image(
+        img, alpha, background_mask = NeRFDataset.__read_image(
             self.image_paths[idx],
             self.img_wh,
             return_alpha=True,
             bg_color=self.bg_color,
+            mask_from_background=self.mask_from_background,
         )
 
         output_dict = {
@@ -391,6 +394,11 @@ class NeRFDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
             output_dict["mask"] = mask
         elif alpha is not None:
             mask = torch.from_numpy(alpha).reshape(1, self.image_h, self.image_w, 1)
+            output_dict["mask"] = mask
+        elif background_mask is not None:
+            mask = torch.from_numpy(background_mask).reshape(
+                1, self.image_h, self.image_w, 1
+            )
             output_dict["mask"] = mask
 
         gradient_mask_path = self.gradient_mask_paths[idx]
@@ -659,9 +667,16 @@ class NeRFDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
         return rays_o, rays_d
 
     @staticmethod
-    def __read_image(img_path, img_wh, return_alpha=False, bg_color=None):
+    def __read_image(
+        img_path,
+        img_wh,
+        return_alpha=False,
+        bg_color=None,
+        mask_from_background=None,
+    ):
         img = imageio.imread(img_path).astype(np.float32) / 255.0
         alpha = None
+        background_mask = None
         # img[..., :3] = srgb_to_linear(img[..., :3])
 
         # Below assume image is float32
@@ -678,6 +693,14 @@ class NeRFDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                 assert False, f"{bg_color} is not a supported background color."
 
         img = cv2.resize(img, img_wh)
+        if mask_from_background == "black":
+            background_mask = (
+                np.any(img[..., :3] != 0.0, axis=-1).astype(np.uint8) * 255
+            )
+        elif mask_from_background == "white":
+            background_mask = (
+                np.any(img[..., :3] != 1.0, axis=-1).astype(np.uint8) * 255
+            )
         img = rearrange(img, "h w c -> (h w) c")
 
         # Convert to uint8 again
@@ -689,7 +712,12 @@ class NeRFDataset(Dataset, BoundedMultiViewDataset, DatasetVisualization):
                 alpha = cv2.resize(alpha, img_wh)
                 alpha = rearrange(alpha, "h w -> (h w)")
                 alpha = (alpha * 255.0).astype(np.uint8)
-            return img, alpha
+            if background_mask is not None:
+                background_mask = rearrange(background_mask, "h w -> (h w)")
+            return img, alpha, background_mask
+        elif background_mask is not None:
+            background_mask = rearrange(background_mask, "h w -> (h w)")
+            return img, background_mask
         else:
             return img
 
