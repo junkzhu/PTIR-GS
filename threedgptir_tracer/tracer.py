@@ -828,6 +828,11 @@ class Tracer:
             pred_dist = pred_dist / pred_opacity
             pred_dist = torch.nan_to_num(pred_dist, 0.0, 0.0)
 
+            # https://github.com/fudan-zvg/IRGS/blob/main/gaussian_renderer/__init__.py#L233
+            pred_pbr = pred_pbr * pred_opacity
+            pred_direct = pred_direct * pred_opacity
+            pred_indirect = pred_indirect * pred_opacity
+
             pred_pbr = self.pred_pbr_filter(pred_pbr)
             pred_light = self.pred_pbr_filter(pred_light)
             pred_direct = self.pred_pbr_filter(pred_direct)

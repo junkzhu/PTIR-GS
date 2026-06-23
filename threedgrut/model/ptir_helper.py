@@ -53,8 +53,8 @@ PBR_GT_MASK_OUTPUT_KEYS = (
     # While other material should be masked to avoid biasing the metrics.
     # https://github.com/fudan-zvg/IRGS/blob/main/eval_material_tensoir.py#L121
     # "pred_pbr",
-    "pred_direct",
-    "pred_indirect",
+    # "pred_direct",
+    # "pred_indirect",
     "pred_light",
     "pred_shadingnormal",
     "pred_material",
