@@ -22,6 +22,7 @@ test_last: true
 validate_first: false
 log_frequency: 1
 compute_extra_metrics: true
+render_frame_stride: 1
 visualize_frequency: 1000
 
 diffusion_prior:

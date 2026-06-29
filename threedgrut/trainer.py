@@ -1503,7 +1503,7 @@ class Trainer3DGRUT:
                 compute_extra_metrics=conf.compute_extra_metrics,
                 post_processing=self.post_processing,
             )
-            renderer.render_all()
+            renderer.render_all(frame_stride=conf.get("render_frame_stride", 1))
 
     @torch.cuda.nvtx.range(f"save_checkpoint")
     def save_checkpoint(self, last_checkpoint: bool = False):

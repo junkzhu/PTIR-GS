@@ -227,12 +227,18 @@ class Renderer:
 
     def create_test_dataloader(self, conf):
         """Create the test dataloader for the given configuration."""
+        dataset = datasets.make_test(name=conf.dataset.type, config=conf)
+        dataloader = torch.utils.data.DataLoader(
+            dataset, **self._test_dataloader_kwargs()
+        )
+        return dataset, dataloader
+
+    @staticmethod
+    def _test_dataloader_kwargs() -> dict:
+        """Create DataLoader kwargs for deterministic test-frame iteration."""
         from threedgrut.datasets.utils import configure_dataloader_for_platform
 
-        dataset = datasets.make_test(name=conf.dataset.type, config=conf)
-
-        # Configure DataLoader arguments for the current platform
-        dataloader_kwargs = configure_dataloader_for_platform(
+        return configure_dataloader_for_platform(
             {
                 "num_workers": 8,
                 "batch_size": 1,
@@ -241,8 +247,12 @@ class Renderer:
             }
         )
 
-        dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
-        return dataset, dataloader
+    @staticmethod
+    def _validate_frame_stride(frame_stride: int) -> int:
+        frame_stride = int(frame_stride)
+        if frame_stride < 1:
+            raise ValueError(f"frame_stride must be >= 1, got {frame_stride}")
+        return frame_stride
 
     @classmethod
     def from_checkpoint(
@@ -446,20 +456,69 @@ class Renderer:
 
     @torch.no_grad()
     def render_relight_environment(
-        self, environment_path: str | Path, output_dir: str | Path
+        self,
+        environment_path: str | Path,
+        output_dir: str | Path,
+        frame_stride: int = 1,
     ) -> Path:
         if self.conf.render.method != "3dgptir":
             raise ValueError(
                 "Relighting requires the PTIR renderer (conf.render.method == '3dgptir')."
             )
 
+        frame_stride = self._validate_frame_stride(frame_stride)
+        frame_indices = list(range(0, len(self.dataset), frame_stride))
+        if not frame_indices:
+            raise ValueError(
+                f"Relight frame sampling selected no frames: dataset_len={len(self.dataset)}, "
+                f"frame_stride={frame_stride}"
+            )
+
         environment_path = Path(environment_path)
         output_dir = Path(output_dir)
-        if (output_dir / "metrics.json").exists():
-            logger.info(f"Skipping {self._environment_output_name(environment_path)}: metrics.json already exists")
-            return output_dir
+        metrics_path = output_dir / "metrics.json"
+        manifest_path = output_dir / "relight.json"
+        if metrics_path.exists():
+            existing_stride = 1
+            existing_total_frames = None
+            if manifest_path.is_file():
+                with open(manifest_path) as f:
+                    manifest = json.load(f)
+                existing_stride = int(manifest.get("frame_stride", existing_stride))
+                existing_total_frames = manifest.get("num_frames_total")
+
+            same_sampling = (
+                existing_stride == frame_stride
+                and (
+                    existing_total_frames is None
+                    or int(existing_total_frames) == len(self.dataset)
+                )
+            )
+            if same_sampling:
+                logger.info(
+                    f"Skipping {self._environment_output_name(environment_path)}: "
+                    "metrics.json already exists"
+                )
+                return output_dir
+            raise FileExistsError(
+                f"Relight metrics already exist at {metrics_path}, but their frame sampling "
+                f"(stride={existing_stride}) does not match the requested sampling "
+                f"(stride={frame_stride}). Use a different --out-dir "
+                "or remove the existing relight environment directory."
+            )
         self._load_relight_environment(environment_path)
         metric = Metric(device="cuda")
+        if frame_stride != 1:
+            relight_dataset = torch.utils.data.Subset(self.dataset, frame_indices)
+            relight_dataloader = torch.utils.data.DataLoader(
+                relight_dataset, **self._test_dataloader_kwargs()
+            )
+            logger.info(
+                "Relight frame sampling enabled: "
+                f"stride={frame_stride}, frames={len(frame_indices)}/{len(self.dataset)}"
+            )
+        else:
+            relight_dataloader = self.dataloader
 
         output_path_ptir_aovs = {}
         for aov_name in ("gt", "pbr", "direct", "indirect", "light"):
@@ -468,12 +527,12 @@ class Renderer:
 
         logger.start_progress(
             task_name=f"Relighting {self._environment_output_name(environment_path)}",
-            total_steps=len(self.dataloader),
+            total_steps=len(frame_indices),
             color="orange1",
         )
 
-        for iteration, batch in enumerate(self.dataloader):
-            frame_name = "{0:05d}.png".format(iteration)
+        for frame_index, batch in zip(frame_indices, relight_dataloader):
+            frame_name = "{0:05d}.png".format(frame_index)
             gpu_batch = self.dataset.get_gpu_batch_with_intrinsics(batch)
             gpu_batch = self._pack_lights_for_batch(gpu_batch)
             outputs = self.model(gpu_batch)
@@ -497,7 +556,7 @@ class Renderer:
             frame_metrics = metric.update_relight_pbr(
                 pred_pbr_linear=outputs["pred_pbr"],
                 dataset=self.dataset,
-                frame_index=iteration,
+                frame_index=frame_index,
                 environment_path=environment_path,
                 bg_color=self.conf.model.background.color,
             )
@@ -523,7 +582,7 @@ class Renderer:
             logger.log_progress(
                 task_name=f"Relighting {self._environment_output_name(environment_path)}",
                 advance=1,
-                iteration=f"{iteration}",
+                iteration=f"{frame_index}",
                 psnr=frame_metrics["psnr_relight_pbr"],
             )
 
@@ -534,7 +593,6 @@ class Renderer:
         logger.info(f"📄 Relight metrics saved to: {metrics_path}")
         logger.info(f"📄 Relight metrics details saved to: {metrics_details_path}")
 
-        manifest_path = output_dir / "relight.json"
         with open(manifest_path, "w") as f:
             json.dump(
                 {
@@ -545,6 +603,9 @@ class Renderer:
                         else str(Path(self.checkpoint_path).resolve())
                     ),
                     "renderer": "3dgptir",
+                    "frame_stride": frame_stride,
+                    "num_frames_rendered": len(frame_indices),
+                    "num_frames_total": len(self.dataset),
                 },
                 f,
                 indent=2,
@@ -552,8 +613,12 @@ class Renderer:
         return output_dir
 
     def render_relight_all(
-        self, environment_dir: str, output_root: str | Path | None = None
+        self,
+        environment_dir: str,
+        output_root: str | Path | None = None,
+        frame_stride: int = 1,
     ) -> list[Path]:
+        frame_stride = self._validate_frame_stride(frame_stride)
         self.conf["render"]["render_spp"] = self.conf["render"]["relight_spp"]
         logger.info(
             f"Relight render_spp set to render.relight_spp={self.conf['render']['relight_spp']}"
@@ -594,7 +659,9 @@ class Renderer:
             )
             output_dirs.append(
                 self.render_relight_environment(
-                    environment_path, output_root / output_name
+                    environment_path,
+                    output_root / output_name,
+                    frame_stride=frame_stride,
                 )
             )
 
@@ -609,6 +676,7 @@ class Renderer:
         environment_dir: str,
         scaled_checkpoint_path: str | Path | None = None,
         output_root: str | Path | None = None,
+        frame_stride: int = 1,
     ) -> list[Path]:
         if scaled_checkpoint_path is None:
             if self.last_scaled_checkpoint_path is not None:
@@ -637,7 +705,9 @@ class Renderer:
             visualize_lights=bool(self.conf.render.get("visualize_lights", False)),
         )
         return relight_renderer.render_relight_all(
-            environment_dir, output_root=output_root
+            environment_dir,
+            output_root=output_root,
+            frame_stride=frame_stride,
         )
 
     @classmethod
@@ -673,10 +743,28 @@ class Renderer:
         )
 
     @torch.no_grad()
-    def render_all(self):
+    def render_all(self, frame_stride: int = 1):
         """Render all the images in the test dataset and log the metrics."""
 
         is_ptir = self.conf.render.method == "3dgptir"
+        frame_stride = self._validate_frame_stride(frame_stride)
+        frame_indices = list(range(0, len(self.dataset), frame_stride))
+        if not frame_indices:
+            raise ValueError(
+                f"Rendering frame sampling selected no frames: dataset_len={len(self.dataset)}, "
+                f"frame_stride={frame_stride}"
+            )
+        if frame_stride != 1:
+            render_dataset = torch.utils.data.Subset(self.dataset, frame_indices)
+            render_dataloader = torch.utils.data.DataLoader(
+                render_dataset, **self._test_dataloader_kwargs()
+            )
+            logger.info(
+                "Render frame sampling enabled: "
+                f"stride={frame_stride}, frames={len(frame_indices)}/{len(self.dataset)}"
+            )
+        else:
+            render_dataloader = self.dataloader
 
         # Criterions that we log during training.
         criterions = {}
@@ -758,10 +846,10 @@ class Renderer:
         worst_psnr_img_gt = None
 
         logger.start_progress(
-            task_name="Rendering", total_steps=len(self.dataloader), color="orange1"
+            task_name="Rendering", total_steps=len(frame_indices), color="orange1"
         )
 
-        for iteration, batch in enumerate(self.dataloader):
+        for iteration, batch in zip(frame_indices, render_dataloader):
             frame_name = "{0:05d}.png".format(iteration)
 
             # Get the GPU-cached batch

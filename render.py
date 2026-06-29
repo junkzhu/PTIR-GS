@@ -77,6 +77,15 @@ if __name__ == "__main__":
         action="store_true",
         help="If set, make environment and visible lights contribute on escaped rays.",
     )
+    parser.add_argument(
+        "--render_frame_stride",
+        type=int,
+        default=1,
+        help=(
+            "Render every Nth test frame. Applies to normal, lights, and "
+            "environment relight rendering. Default: 1."
+        ),
+    )
     args = parser.parse_args()
 
     if args.environment_relight and not args.environment_dir:
@@ -85,6 +94,8 @@ if __name__ == "__main__":
         parser.error("--environment-path cannot be used with --environment-relight")
     if not args.environment_relight and not args.out_dir:
         parser.error("--out-dir is required unless --environment-relight is set")
+    if args.render_frame_stride < 1:
+        parser.error("--render_frame_stride must be >= 1")
 
     out_dir = args.out_dir
     if args.environment_relight and out_dir is None:
@@ -101,7 +112,10 @@ if __name__ == "__main__":
             create_run_dir=False,
             visualize_lights=visualize_lights,
         )
-        renderer.render_relight_all(environment_dir=args.environment_dir)
+        renderer.render_relight_all(
+            environment_dir=args.environment_dir,
+            frame_stride=args.render_frame_stride,
+        )
     elif args.lights_relight:
         renderer = Renderer.from_checkpoint(
             checkpoint_path=args.checkpoint,
@@ -158,7 +172,7 @@ if __name__ == "__main__":
                 device=renderer.model.device,
             ),
         ]
-        renderer.render_all()
+        renderer.render_all(frame_stride=args.render_frame_stride)
     else:
         renderer = Renderer.from_checkpoint(
             checkpoint_path=args.checkpoint,
@@ -169,4 +183,4 @@ if __name__ == "__main__":
             visualize_lights=visualize_lights,
             environment_path=args.environment_path,
         )
-        renderer.render_all()
+        renderer.render_all(frame_stride=args.render_frame_stride)

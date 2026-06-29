@@ -12,6 +12,7 @@ INVERSION_CONFIG_NAME="inversions/nerf_synthetic_3dgptir.yaml"
 INVERSION_OUT_DIR=""
 RELIGHT_ENV_DIR=""
 RELIGHT_OUT_DIR=""
+RENDER_FRAME_STRIDE=1
 RUN_INVERSION=true
 RUN_RELIGHT=true
 FORCE_TRAIN=false
@@ -37,6 +38,8 @@ Options:
   --no_inversion          Only run/skip stage1 training; do not run PTIR inversion.
   --relight_env_dir PATH  Environment maps for relight. Default: $DATA_ROOT/Environment_Maps/high_res_envmaps_2k
   --relight_out_dir PATH  Relight render output root. Default: checkpoint run directory.
+  --render_frame_stride N
+                          Render every Nth test frame after training/inversion and relight. Default: $RENDER_FRAME_STRIDE
   --no_relight            Do not run relight after PTIR inversion.
   --force_train           Run stage1 training even if ckpt_last.pt already exists.
   --dataset_config NAME   Hydra dataset config. Default: $DATASET_CONFIG
@@ -90,6 +93,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --relight_out_dir)
             RELIGHT_OUT_DIR="$2"
+            shift 2
+            ;;
+        --render_frame_stride)
+            RENDER_FRAME_STRIDE="$2"
             shift 2
             ;;
         --no_relight)
@@ -210,6 +217,7 @@ run_inversion() {
         echo "initialization.path=$initialization_path"
         echo "out_dir=$INVERSION_OUT_DIR"
         echo "experiment_name=${scene}_inversion"
+        echo "render_frame_stride=$RENDER_FRAME_STRIDE"
         printf 'inversion_extra_args=%q ' "${INVERSION_EXTRA_ARGS[@]}"
         echo
         nvidia-smi || true
@@ -220,6 +228,7 @@ run_inversion() {
             "initialization.path=$initialization_path" \
             "out_dir=$INVERSION_OUT_DIR" \
             "experiment_name=${scene}_inversion" \
+            "render_frame_stride=$RENDER_FRAME_STRIDE" \
             "${INVERSION_EXTRA_ARGS[@]}"
     } > "$log_file" 2>&1
     echo "[$(date '+%F %T')] Finished PTIR inversion scene=$scene on CUDA_VISIBLE_DEVICES=$gpu_id"
@@ -235,6 +244,7 @@ run_relight() {
         --checkpoint "$checkpoint_path"
         --environment-relight
         --environment-dir "$RELIGHT_ENV_DIR"
+        --render_frame_stride "$RENDER_FRAME_STRIDE"
     )
 
     if [[ -z "$relight_out_display" ]]; then
@@ -250,6 +260,7 @@ run_relight() {
         echo "checkpoint=$checkpoint_path"
         echo "out_dir=$relight_out_display"
         echo "environment_dir=$RELIGHT_ENV_DIR"
+        echo "render_frame_stride=$RENDER_FRAME_STRIDE"
         echo
         nvidia-smi || true
         CUDA_VISIBLE_DEVICES="$gpu_id" python render.py "${render_args[@]}"
@@ -283,6 +294,7 @@ run_scene() {
             echo "path=$DATA_ROOT/$scene"
             echo "out_dir=$OUT_DIR"
             echo "experiment_name=$scene"
+            echo "render_frame_stride=$RENDER_FRAME_STRIDE"
             printf 'scene_args=%q ' "${scene_args[@]}"
             echo
             nvidia-smi || true
@@ -292,6 +304,7 @@ run_scene() {
                 "path=$DATA_ROOT/$scene" \
                 "out_dir=$OUT_DIR" \
                 "experiment_name=$scene" \
+                "render_frame_stride=$RENDER_FRAME_STRIDE" \
                 "${scene_args[@]}" \
                 "${EXTRA_ARGS[@]}"
         } > "$log_file" 2>&1
