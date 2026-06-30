@@ -86,6 +86,16 @@ if __name__ == "__main__":
             "environment relight rendering. Default: 1."
         ),
     )
+    parser.add_argument(
+        "--override",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Hydra/OmegaConf-style checkpoint config override. May be passed "
+            "multiple times, e.g. --override render.max_bounces=10."
+        ),
+    )
     args = parser.parse_args()
 
     if args.environment_relight and not args.environment_dir:
@@ -111,6 +121,7 @@ if __name__ == "__main__":
             computes_extra_metrics=False,
             create_run_dir=False,
             visualize_lights=visualize_lights,
+            config_overrides=args.override,
         )
         renderer.render_relight_all(
             environment_dir=args.environment_dir,
@@ -126,6 +137,7 @@ if __name__ == "__main__":
             visualize_lights=visualize_lights,
             restore_environment=args.environment_path is not None,
             environment_path=args.environment_path,
+            config_overrides=args.override,
         )
 
         # Lights relight has no paired GT target, so metrics are always disabled.
@@ -182,5 +194,6 @@ if __name__ == "__main__":
             computes_extra_metrics=args.compute_extra_metrics,
             visualize_lights=visualize_lights,
             environment_path=args.environment_path,
+            config_overrides=args.override,
         )
         renderer.render_all(frame_stride=args.render_frame_stride)

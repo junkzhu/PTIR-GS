@@ -15,11 +15,15 @@ RELIGHT_OUT_DIR=""
 RENDER_FRAME_STRIDE=1
 RUN_INVERSION=true
 RUN_RELIGHT=true
+RUN_PRECOMPILE=true
+RUN_RENDER_AFTER_INVERSION=false
 FORCE_TRAIN=false
 DATASET_CONFIG="tensoir"
 SCENES=(lego armadillo hotdog ficus)
 EXTRA_ARGS=()
 INVERSION_EXTRA_ARGS=()
+RENDER_EXTRA_ARGS=()
+RENDER_OVERRIDES=()
 
 usage() {
     cat <<EOF
@@ -35,7 +39,9 @@ Options:
   --inversion_out_dir PATH
                           PTIR inversion output directory. Default: same as --out_dir.
   --inversion_args "ARGS" Extra Hydra args only for PTIR inversion.
+  --render_args "ARGS"    Extra render.py args for post-inversion render and relight.
   --no_inversion          Only run/skip stage1 training; do not run PTIR inversion.
+  --no_precompile         Do not precompile PTIR native plugin before inversion.
   --relight_env_dir PATH  Environment maps for relight. Default: $DATA_ROOT/Environment_Maps/high_res_envmaps_2k
   --relight_out_dir PATH  Relight render output root. Default: checkpoint run directory.
   --render_frame_stride N
@@ -83,8 +89,17 @@ while [[ $# -gt 0 ]]; do
             read -r -a INVERSION_EXTRA_ARGS <<< "$2"
             shift 2
             ;;
+        --render_args)
+            read -r -a RENDER_EXTRA_ARGS <<< "$2"
+            RUN_RENDER_AFTER_INVERSION=true
+            shift 2
+            ;;
         --no_inversion)
             RUN_INVERSION=false
+            shift
+            ;;
+        --no_precompile)
+            RUN_PRECOMPILE=false
             shift
             ;;
         --relight_env_dir)
@@ -149,6 +164,34 @@ fi
 
 mkdir -p "$OUT_DIR/logs" "$INVERSION_OUT_DIR/logs"
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$OUT_DIR/.cache}"
+
+parse_render_args() {
+    local idx=0
+    RENDER_OVERRIDES=()
+
+    while [[ $idx -lt ${#RENDER_EXTRA_ARGS[@]} ]]; do
+        case "${RENDER_EXTRA_ARGS[$idx]}" in
+            --override)
+                idx=$((idx + 1))
+                if [[ $idx -ge ${#RENDER_EXTRA_ARGS[@]} ]]; then
+                    echo "Missing value for --override in --render_args"
+                    exit 1
+                fi
+                RENDER_OVERRIDES+=("${RENDER_EXTRA_ARGS[$idx]}")
+                ;;
+            --override=*)
+                RENDER_OVERRIDES+=("${RENDER_EXTRA_ARGS[$idx]#--override=}")
+                ;;
+            *)
+                echo "Unsupported --render_args token: ${RENDER_EXTRA_ARGS[$idx]}"
+                exit 1
+                ;;
+        esac
+        idx=$((idx + 1))
+    done
+}
+
+parse_render_args
 
 precompile_inversion_plugin() {
     local gpu_id="$1"
@@ -234,11 +277,61 @@ run_inversion() {
     echo "[$(date '+%F %T')] Finished PTIR inversion scene=$scene on CUDA_VISIBLE_DEVICES=$gpu_id"
 }
 
+run_render() {
+    local scene="$1"
+    local gpu_id="$2"
+    local checkpoint_path="$3"
+    local render_out_dir
+    local log_file="$INVERSION_OUT_DIR/logs/render_${scene}.log"
+    local overrides_env=""
+
+    render_out_dir="$(dirname "$checkpoint_path")"
+    if [[ ${#RENDER_OVERRIDES[@]} -gt 0 ]]; then
+        printf -v overrides_env '%s\n' "${RENDER_OVERRIDES[@]}"
+    fi
+
+    echo "[$(date '+%F %T')] Starting post-inversion render scene=$scene on CUDA_VISIBLE_DEVICES=$gpu_id"
+    {
+        echo "scene=$scene"
+        echo "cuda_device=$gpu_id"
+        echo "checkpoint=$checkpoint_path"
+        echo "out_dir=$render_out_dir"
+        echo "render_frame_stride=$RENDER_FRAME_STRIDE"
+        printf 'render_extra_args=%q ' "${RENDER_EXTRA_ARGS[@]}"
+        echo
+        nvidia-smi || true
+        CHECKPOINT_PATH="$checkpoint_path" \
+        RENDER_OUT_DIR="$render_out_dir" \
+        RENDER_FRAME_STRIDE="$RENDER_FRAME_STRIDE" \
+        RENDER_CONFIG_OVERRIDES="$overrides_env" \
+        CUDA_VISIBLE_DEVICES="$gpu_id" python - <<'PY'
+import os
+
+from threedgrut.render import Renderer
+
+overrides = [
+    item
+    for item in os.environ.get("RENDER_CONFIG_OVERRIDES", "").splitlines()
+    if item
+]
+renderer = Renderer.from_checkpoint(
+    checkpoint_path=os.environ["CHECKPOINT_PATH"],
+    out_dir=os.environ["RENDER_OUT_DIR"],
+    save_gt=False,
+    create_run_dir=False,
+    config_overrides=overrides,
+)
+renderer.render_all(frame_stride=int(os.environ["RENDER_FRAME_STRIDE"]))
+PY
+    } > "$log_file" 2>&1
+    echo "[$(date '+%F %T')] Finished post-inversion render scene=$scene on CUDA_VISIBLE_DEVICES=$gpu_id"
+}
+
 run_relight() {
     local scene="$1"
     local gpu_id="$2"
     local checkpoint_path="$3"
-    local log_file="$OUT_DIR/logs/relight_${scene}.log"
+    local log_file="$INVERSION_OUT_DIR/logs/relight_${scene}.log"
     local relight_out_display="$RELIGHT_OUT_DIR"
     local render_args=(
         --checkpoint "$checkpoint_path"
@@ -261,9 +354,10 @@ run_relight() {
         echo "out_dir=$relight_out_display"
         echo "environment_dir=$RELIGHT_ENV_DIR"
         echo "render_frame_stride=$RENDER_FRAME_STRIDE"
+        printf 'render_extra_args=%q ' "${RENDER_EXTRA_ARGS[@]}"
         echo
         nvidia-smi || true
-        CUDA_VISIBLE_DEVICES="$gpu_id" python render.py "${render_args[@]}"
+        CUDA_VISIBLE_DEVICES="$gpu_id" python render.py "${render_args[@]}" "${RENDER_EXTRA_ARGS[@]}"
     } > "$log_file" 2>&1
     echo "[$(date '+%F %T')] Finished relight scene=$scene on CUDA_VISIBLE_DEVICES=$gpu_id"
 }
@@ -318,18 +412,23 @@ run_scene() {
             return 1
         fi
         run_inversion "$scene" "$gpu_id" "$checkpoint_path"
-        if [[ "$RUN_RELIGHT" == true ]]; then
+        if [[ "$RUN_RENDER_AFTER_INVERSION" == true || "$RUN_RELIGHT" == true ]]; then
             inversion_checkpoint_path="$(find_latest_inversion_checkpoint "$scene" || true)"
             if [[ -z "$inversion_checkpoint_path" ]]; then
-                echo "[$(date '+%F %T')] No PTIR inversion checkpoint found for scene=$scene; skipping relight."
+                echo "[$(date '+%F %T')] No PTIR inversion checkpoint found for scene=$scene; skipping render/relight."
                 return 1
             fi
+        fi
+        if [[ "$RUN_RENDER_AFTER_INVERSION" == true ]]; then
+            run_render "$scene" "$gpu_id" "$inversion_checkpoint_path"
+        fi
+        if [[ "$RUN_RELIGHT" == true ]]; then
             run_relight "$scene" "$gpu_id" "$inversion_checkpoint_path"
         fi
     fi
 }
 
-if [[ "$RUN_INVERSION" == true ]]; then
+if [[ "$RUN_INVERSION" == true && "$RUN_PRECOMPILE" == true ]]; then
     precompile_inversion_plugin "${GPU_IDS[0]}"
 fi
 

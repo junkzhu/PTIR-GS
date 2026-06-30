@@ -125,7 +125,7 @@ Thanks for these great projects!
 ## BibTeX
 If you find our code or paper helps, please consider citing:
 ```bibtex
-@misc{zhu2026pathtracedinverserenderingglobal,
+@misc{ptir-gs,
       title={Path-Traced Inverse Rendering with Global Illumination in 3D Gaussian Fields}, 
       author={Junke Zhu and Hao Zhang and Yutian Zhu and Ang Li and Chenxiao Hu and Meng Gai and Fei Zhu and Zhangjin Huang and Sheng Li},
       year={2026},
