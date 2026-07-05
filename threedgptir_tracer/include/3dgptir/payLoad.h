@@ -62,6 +62,7 @@ struct rayPayload {
         rayDirGrad               = make_float3(0.f);
         hit                      = 0;
         valid                    = false;
+        interactionParticleId    = -1;
     }
 
     Ray ray;
@@ -85,6 +86,7 @@ struct rayPayload {
 
     unsigned int hit;
     bool valid;
+    int32_t interactionParticleId; ///< stochastic pipeline: sampled surface particle (-1 = none)
 };
 
 struct PendingRayDirectionGrad {
@@ -99,6 +101,7 @@ struct PendingRayDirectionGrad {
         maxHitDistance = 0.f;
         dNextDirDRoughness = make_float3(0.f);
         numBounces = 0u;
+        interactionParticleId = -1;
     }
 
     __device__ void set(
@@ -106,7 +109,8 @@ struct PendingRayDirectionGrad {
         const float pendingOpacity,
         const float pendingMaxHitDistance,
         const float3& pendingDNextDirDRoughness,
-        const unsigned int pendingNumBounces) {
+        const unsigned int pendingNumBounces,
+        const int32_t pendingInteractionParticleId = -1) {
         const float gradLength2 =
             pendingDNextDirDRoughness.x * pendingDNextDirDRoughness.x +
             pendingDNextDirDRoughness.y * pendingDNextDirDRoughness.y +
@@ -117,6 +121,7 @@ struct PendingRayDirectionGrad {
         maxHitDistance = pendingMaxHitDistance;
         dNextDirDRoughness = pendingDNextDirDRoughness;
         numBounces = pendingNumBounces;
+        interactionParticleId = pendingInteractionParticleId;
     }
 
     bool valid;
@@ -125,6 +130,7 @@ struct PendingRayDirectionGrad {
     float maxHitDistance;
     float3 dNextDirDRoughness;
     unsigned int numBounces;
+    int32_t interactionParticleId; ///< stochastic pipeline: sampled surface particle of the pending surface
 };
 
 struct pathPayload {

@@ -835,3 +835,90 @@ __device__ inline void processHitBwd(
         transmittance = nextTransmit;
     }
 }
+
+// =====================================================================================
+// Stochastic single-Gaussian surface selection (stage2 fullStochastic).
+// Evaluates one particle: its galpha (for the free-flight acceptance test in the
+// raygen loop) plus, if accepted, the single-particle surface attributes (center
+// projection hitT, raw material, shading normal, geometric normal). No compositing,
+// no weight — the raygen loop picks the first particle whose galpha passes
+// sampler.next_1d(), and its raw attributes become the surface interaction.
+// Purely additive: processHit / processHitBwd above are untouched.
+// =====================================================================================
+template <int ParticleKernelDegree = 4, bool SurfelPrimitive = false>
+__device__ inline float evalHitStochastic(
+    const float3& rayOrigin,
+    const float3& rayDirection,
+    const int32_t particleIdx,
+    const ParticleDensity* particlesDensity,
+    const Material* particlesMaterial,
+    const float minParticleKernelDensity,
+    const float minParticleAlpha,
+    const float* particlesShadingNormal,
+    float* hitT,
+    Material* material,
+    float3* shadingnormal,
+    float3* normal) {
+    float3 particlePosition;
+    float3 particleScale;
+    float33 particleRotation;
+    float particleDensity;
+
+    fetchParticleDensity(
+        particleIdx,
+        particlesDensity,
+        particlePosition,
+        particleScale,
+        particleRotation,
+        particleDensity);
+
+    const float3 giscl   = make_float3(1 / particleScale.x, 1 / particleScale.y, 1 / particleScale.z);
+    const float3 gposc   = (rayOrigin - particlePosition);
+    const float3 gposcr  = (gposc * particleRotation);
+    const float3 gro     = giscl * gposcr;
+    const float3 rayDirR = rayDirection * particleRotation;
+    const float3 grdu    = giscl * rayDirR;
+    const float3 grd     = safe_normalize(grdu);
+
+    const float3 gcrod   = SurfelPrimitive ? gro + grd * -gro.z / grd.z : cross(grd, gro);
+    const float grayDist = dot(gcrod, gcrod);
+
+    const float gres   = particleResponse<ParticleKernelDegree>(grayDist);
+    const float galpha = fminf(0.99f, gres * particleDensity);
+
+    const bool acceptHit = (gres > minParticleKernelDensity) && (galpha > minParticleAlpha);
+    if (!acceptHit) {
+        return 0.0f;
+    }
+
+    // distance to the gaussian center projection on the ray
+    const float3 grds = particleScale * grd * (SurfelPrimitive ? -gro.z / grd.z : dot(grd, -1 * gro));
+    *hitT = sqrtf(dot(grds, grds));
+
+    if (material) {
+        float3 particleAlbedo;
+        float particleRoughness;
+        float particleMetallic;
+        fetchParticleMaterial(
+            particleIdx,
+            particlesMaterial,
+            particleAlbedo,
+            particleRoughness,
+            particleMetallic);
+        *material = Material(particleAlbedo, particleRoughness, particleMetallic);
+    }
+
+    if (normal) {
+        if (shadingnormal) {
+            *shadingnormal = make_float3(
+                particlesShadingNormal[particleIdx * 3 + 0],
+                particlesShadingNormal[particleIdx * 3 + 1],
+                particlesShadingNormal[particleIdx * 3 + 2]);
+        }
+        constexpr float ellispoidSqRadius = 9.0f;
+        const float3 particleScaleRotated = (particleRotation * particleScale);
+        *normal = (SurfelPrimitive ? make_float3(0, 0, (grd.z > 0 ? 1 : -1) * particleScaleRotated.z) : safe_normalize((gro + grd * (dot(grd, -1 * gro) - sqrtf(ellispoidSqRadius - grayDist))) * particleScaleRotated));
+    }
+
+    return galpha;
+}

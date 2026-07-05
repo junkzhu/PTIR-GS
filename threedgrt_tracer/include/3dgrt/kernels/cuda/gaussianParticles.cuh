@@ -770,3 +770,308 @@ __device__ inline void processHitBwd(
         transmittance = nextTransmit;
     }
 }
+
+// =====================================================================================
+// Stochastic (fullStochastic) estimator device functions.
+// Ported from Stoch3DGS with PTIR shading-normal support added along the SH-radiance
+// path: in stochastic mode a single sampled particle's shading normal is selected
+// (not alpha-composited), forward and backward following the same sampling as radiance.
+// Purely additive: the deterministic processHit / processHitBwd above are untouched.
+// =====================================================================================
+
+template <int ParticleKernelDegree = 4, bool SurfelPrimitive = false>
+__device__ inline bool processHitStochastic(
+    const float3& rayOrigin,
+    const float3& rayDirection,
+    const int32_t particleIdx,
+    const ParticleDensity* particlesDensity,
+    const float* particlesSphCoefficients,
+    const float minParticleKernelDensity,
+    const float minParticleAlpha,
+    const int32_t sphEvalDegree,
+    const float* particlesShadingNormal,
+    float* transmittance,
+    float3* radiance,
+    float* depth,
+    float3* shadingnormal,
+    float3* normal) {
+    float3 particlePosition;
+    float3 particleScale;
+    float33 particleRotation;
+    float particleDensity;
+
+    fetchParticleDensity(
+        particleIdx,
+        particlesDensity,
+        particlePosition,
+        particleScale,
+        particleRotation,
+        particleDensity);
+
+    const float3 giscl   = make_float3(1 / particleScale.x, 1 / particleScale.y, 1 / particleScale.z);
+    const float3 gposc   = (rayOrigin - particlePosition);
+    const float3 gposcr  = (gposc * particleRotation);
+    const float3 gro     = giscl * gposcr;
+    const float3 rayDirR = rayDirection * particleRotation;
+    const float3 grdu    = giscl * rayDirR;
+    const float3 grd     = safe_normalize(grdu);
+
+    // distance to the gaussian center projection on the ray
+    const float3 grds = particleScale * grd * (SurfelPrimitive ? -gro.z / grd.z : dot(grd, -1 * gro));
+    const float hitT  = sqrtf(dot(grds, grds));
+
+    const float3 gcrod   = SurfelPrimitive ? gro + grd * -gro.z / grd.z : cross(grd, gro);
+    const float grayDist = dot(gcrod, gcrod);
+    const float gres   = particleResponse<ParticleKernelDegree>(grayDist);
+    const float galpha = fminf(0.99f, gres * particleDensity);
+    const bool acceptHit = (gres > minParticleKernelDensity) && (galpha > minParticleAlpha);
+    if (!acceptHit) {
+        return false;
+    }
+    // radiance from sph coefficients (sampled single particle, not composited)
+    float3 sphCoefficients[SPH_MAX_NUM_COEFFS];
+    fetchParticleSphCoefficients(
+        particleIdx,
+        particlesSphCoefficients,
+        &sphCoefficients[0]);
+    const float3 grad = radianceFromSpH(sphEvalDegree, &sphCoefficients[0], rayDirection);
+
+    *radiance = grad;
+    *transmittance = 0.0f;
+    *depth = hitT;
+
+    // shading normal: sample this particle's shading normal (SH-color-like path)
+    if (shadingnormal) {
+        *shadingnormal = make_float3(
+            particlesShadingNormal[particleIdx * 3 + 0],
+            particlesShadingNormal[particleIdx * 3 + 1],
+            particlesShadingNormal[particleIdx * 3 + 2]);
+    }
+
+    if (normal) {
+        constexpr float ellispoidSqRadius = 9.0f;
+        const float3 particleScaleRotated = (particleRotation * particleScale);
+        *normal = (SurfelPrimitive ? make_float3(0, 0, (grd.z > 0 ? 1 : -1) * particleScaleRotated.z) : safe_normalize((gro + grd * (dot(grd, -1 * gro) - sqrtf(ellispoidSqRadius - grayDist))) * particleScaleRotated));
+    }
+
+    return true;
+}
+
+template <int ParticleKernelDegree = 4, bool SurfelPrimitive = false>
+__device__ inline float getDensityStochastic(
+    const float3& rayOrigin,
+    const float3& rayDirection,
+    const int32_t particleIdx,
+    const ParticleDensity* particlesDensity) {
+
+    float3 particlePosition;
+    float3 particleScale;
+    float33 particleRotation;
+    float particleDensity;
+
+    fetchParticleDensity(
+        particleIdx,
+        particlesDensity,
+        particlePosition,
+        particleScale,
+        particleRotation,
+        particleDensity);
+
+    const float3 giscl   = make_float3(1 / particleScale.x, 1 / particleScale.y, 1 / particleScale.z);
+    const float3 gposc   = (rayOrigin - particlePosition);
+    const float3 gposcr  = (gposc * particleRotation);
+    const float3 gro     = giscl * gposcr;
+    const float3 rayDirR = rayDirection * particleRotation;
+    const float3 grdu    = giscl * rayDirR;
+    const float3 grd     = safe_normalize(grdu);
+
+    const float3 gcrod   = SurfelPrimitive ? gro + grd * -gro.z / grd.z : cross(grd, gro);
+    const float grayDist = dot(gcrod, gcrod);
+
+    const float gres   = particleResponse<ParticleKernelDegree>(grayDist);
+    const float galpha = fminf(0.99f, gres * particleDensity);
+
+    return galpha;
+}
+
+// Control-variate stochastic backward for the fullStochastic estimator.
+// Extended with the shading-normal residual term (same control-variate form as radiance)
+// and per-particle shading-normal gradient accumulation.
+template <int ParticleKernelDegree = 4, bool SurfelPrimitive = false>
+__device__ inline void processHitStochasticBwd2(
+    const float3& rayOrigin,
+    const float3& rayDirection,
+    int32_t particleIdx,
+    int32_t particleResidualIdx,
+    const ParticleDensity* particleDensityPtr,
+    ParticleDensity* particleDensityGradPtr,
+    const float* particleRadiancePtr,
+    float* particleRadianceGradPtr,
+    const float* particlesShadingNormal,
+    float* particlesShadingNormalGrad,
+    float* gradVis,
+    float minParticleKernelDensity,
+    float minParticleAlpha,
+    float minTransmittance,
+    int32_t sphEvalDegree,
+    float transmittanceGrad,   // supported for stochastic
+    float3 radianceGrad,       // supported for stochastic
+    float3 shadingNormalGrad   // supported for stochastic (SH-color-like path)
+    // depthGrad not supported for stochastic
+    ) {
+    float3 particlePosition;
+    float3 gscl;
+    float33 particleRotation;
+    float particleDensity;
+    float4 grot;
+
+    {
+        const ParticleDensity particleData = particleDensityPtr[particleIdx];
+        particlePosition                   = particleData.position;
+        gscl                               = particleData.scale;
+        grot                               = particleData.quaternion;
+        quaternionWXYZToMatrix(grot, particleRotation);
+        particleDensity = particleData.density;
+    }
+
+    // project ray in the gaussian
+    const float3 giscl   = make_float3(1 / gscl.x, 1 / gscl.y, 1 / gscl.z);
+    const float3 gposc   = (rayOrigin - particlePosition);
+    const float3 gposcr  = (gposc * particleRotation);
+    const float3 gro     = giscl * gposcr;
+    const float3 rayDirR = rayDirection * particleRotation;
+    const float3 grdu    = giscl * rayDirR;
+    const float3 grd     = safe_normalize(grdu);
+    const float3 gcrod   = SurfelPrimitive ? gro + grd * -gro.z / grd.z : cross(grd, gro);
+    const float grayDist = dot(gcrod, gcrod);
+
+    const float gres   = particleResponse<ParticleKernelDegree>(grayDist);
+    const float galpha = fminf(0.99f, gres * particleDensity);
+
+    if ((gres > minParticleKernelDensity) && (galpha > minParticleAlpha)) {
+        ParticleDensity& particleDensityGrad = particleDensityGradPtr[particleIdx];
+
+        const float3 grdd   = grd * (SurfelPrimitive ? -gro.z / grd.z : dot(grd, -1 * gro));
+        const float3 grds   = gscl * grdd;
+        const float gsqdist = dot(grds, grds);
+        const float gdist   = sqrtf(gsqdist);
+
+        // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        // gradient wrt the sph coefficients of the sampled particle (weight 1)
+        float3 sphCoefficients[SPH_MAX_NUM_COEFFS];
+        fetchParticleSphCoefficients(
+            particleIdx,
+            particleRadiancePtr,
+            &sphCoefficients[0]);
+
+        float3 grad_cur = radianceFromSpHBwd(sphEvalDegree, &sphCoefficients[0], rayDirection, 1.0f, radianceGrad,
+                                            (float3*)&particleRadianceGradPtr[particleIdx * SPH_MAX_NUM_COEFFS * 3]);
+
+        float3 grad_res = make_float3(0.0f);
+        if (particleResidualIdx >= 0) {
+            float3 sphCoefficients_res[SPH_MAX_NUM_COEFFS];
+            fetchParticleSphCoefficients(
+                particleResidualIdx,
+                particleRadiancePtr,
+                &sphCoefficients_res[0]);
+            grad_res = radianceFromSpH(sphEvalDegree, &sphCoefficients_res[0], rayDirection);
+        }
+
+        // shading normal: sampled particle vs residual particle (control-variate),
+        // same SH-color-like form as radiance.
+        const float3 sn_cur = make_float3(
+            particlesShadingNormal[particleIdx * 3 + 0],
+            particlesShadingNormal[particleIdx * 3 + 1],
+            particlesShadingNormal[particleIdx * 3 + 2]);
+        float3 sn_res = make_float3(0.0f);
+        if (particleResidualIdx >= 0) {
+            sn_res = make_float3(
+                particlesShadingNormal[particleResidualIdx * 3 + 0],
+                particlesShadingNormal[particleResidualIdx * 3 + 1],
+                particlesShadingNormal[particleResidualIdx * 3 + 2]);
+        }
+
+        const float transmittanceCoeff = 1.0f / galpha;
+
+        float densityGrad = ((grad_cur - grad_res).x * radianceGrad.x +
+                            (grad_cur - grad_res).y * radianceGrad.y +
+                            (grad_cur - grad_res).z * radianceGrad.z +
+                            (sn_cur - sn_res).x * shadingNormalGrad.x +
+                            (sn_cur - sn_res).y * shadingNormalGrad.y +
+                            (sn_cur - sn_res).z * shadingNormalGrad.z) * transmittanceCoeff;
+        atomicAdd(
+            &particleDensityGrad.density, gres * densityGrad);
+
+        // gradient wrt the sampled particle's own shading normal (weight 1)
+        atomicAdd(&particlesShadingNormalGrad[particleIdx * 3 + 0], shadingNormalGrad.x);
+        atomicAdd(&particlesShadingNormalGrad[particleIdx * 3 + 1], shadingNormalGrad.y);
+        atomicAdd(&particlesShadingNormalGrad[particleIdx * 3 + 2], shadingNormalGrad.z);
+
+        // dL/dalpha = densityGrad; alpha = gres * particleDensity
+        // dL/dgres = densityGrad * particleDensity
+        const float gresGrd = particleDensity * densityGrad;
+
+        const float grayDistGrd = particleResponseGrd<PARTICLE_KERNEL_DEGREE>(grayDist, gres, gresGrd);
+
+        float3 grdGrd, groGrd;
+        if (SurfelPrimitive) {
+            const float3 surfelNm    = make_float3(0, 0, 1);
+            const float doSurfelGro  = dot(surfelNm, gro);
+            const float dotSurfelGrd = dot(surfelNm, grd); // cannot be null otherwise no hit
+            const float ghitT        = -doSurfelGro / dotSurfelGrd;
+            const float3 ghitPos     = gro + grd * ghitT;
+            const float3 ghitPosGrd = 2 * ghitPos * grayDistGrd;
+
+            groGrd = ghitPosGrd;
+            grdGrd = ghitT * ghitPosGrd;
+            const float ghitTGrd = sum(grd * ghitPosGrd);
+
+            groGrd += (-surfelNm * ghitTGrd) / dotSurfelGrd;
+            const float dotSurfelGrdGrd = (doSurfelGro * ghitTGrd) / (dotSurfelGrd * dotSurfelGrd);
+            grdGrd += surfelNm * dotSurfelGrdGrd;
+        } else {
+            const float3 gcrodLocal = cross(grd, gro);
+            const float3 gcrodGrd = 2 * gcrodLocal * grayDistGrd;
+
+            grdGrd = make_float3(gcrodGrd.z * gro.y - gcrodGrd.y * gro.z,
+                                 gcrodGrd.x * gro.z - gcrodGrd.z * gro.x,
+                                 gcrodGrd.y * gro.x - gcrodGrd.x * gro.y);
+            groGrd = make_float3(gcrodGrd.y * grd.z - gcrodGrd.z * grd.y,
+                                 gcrodGrd.z * grd.x - gcrodGrd.x * grd.z,
+                                 gcrodGrd.x * grd.y - gcrodGrd.y * grd.x);
+        }
+
+        const float3 gsclGrdGro = make_float3((-gposcr.x / (gscl.x * gscl.x)),
+                                              (-gposcr.y / (gscl.y * gscl.y)),
+                                              (-gposcr.z / (gscl.z * gscl.z))) *
+                                  (groGrd);
+        const float3 gposcrGrd = giscl * (groGrd);
+
+        const float3 gposcGrd     = matmul_bw_vec(particleRotation, gposcrGrd);
+        const float4 grotGrdPoscr = matmul_bw_quat(gposc, gposcrGrd, grot);
+
+        const float3 rayMoGPosGrd = -gposcGrd;
+        atomicAdd(&particleDensityGrad.position.x, rayMoGPosGrd.x);
+        atomicAdd(&particleDensityGrad.position.y, rayMoGPosGrd.y);
+        atomicAdd(&particleDensityGrad.position.z, rayMoGPosGrd.z);
+        (*gradVis) += rayMoGPosGrd.x;
+
+        const float3 grduGrd = safe_normalize_bw(grdu, grdGrd);
+
+        float3 densityGradIncre = make_float3(
+            gsclGrdGro.x + (-rayDirR.x / (gscl.x * gscl.x)) * grduGrd.x,
+            gsclGrdGro.y + (-rayDirR.y / (gscl.y * gscl.y)) * grduGrd.y,
+            gsclGrdGro.z + (-rayDirR.z / (gscl.z * gscl.z)) * grduGrd.z);
+        atomicAdd(&particleDensityGrad.scale.x, densityGradIncre.x);
+        atomicAdd(&particleDensityGrad.scale.y, densityGradIncre.y);
+        atomicAdd(&particleDensityGrad.scale.z, densityGradIncre.z);
+
+        const float3 rayDirRGrd = giscl * grduGrd;
+
+        const float4 grotGrdRayDirR = matmul_bw_quat(rayDirection, rayDirRGrd, grot);
+        atomicAdd(&particleDensityGrad.quaternion.x, grotGrdPoscr.x + grotGrdRayDirR.x);
+        atomicAdd(&particleDensityGrad.quaternion.y, grotGrdPoscr.y + grotGrdRayDirR.y);
+        atomicAdd(&particleDensityGrad.quaternion.z, grotGrdPoscr.z + grotGrdRayDirR.z);
+        atomicAdd(&particleDensityGrad.quaternion.w, grotGrdPoscr.w + grotGrdRayDirR.w);
+    }
+}

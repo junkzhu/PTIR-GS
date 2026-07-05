@@ -679,3 +679,234 @@ static __device__ __inline__ void writePbrOutputs(
     params.rayPbrComponents[idx.z][idx.y][idx.x][1][1] = payload.accumulatedIndirectLighting.y;
     params.rayPbrComponents[idx.z][idx.y][idx.x][1][2] = payload.accumulatedIndirectLighting.z;
 }
+
+// =====================================================================================
+// Stochastic single-Gaussian surface path tracer (stage2 fullStochastic).
+// Free-flight selection: march the sorted k-buffer front-to-back, accept the first
+// particle whose galpha passes sampler.next_1d(); its raw attributes become the
+// surface. P(select i) = galpha_i * prod_{j<i}(1-galpha_j) = the alpha-compositing
+// weight, so this is an unbiased single-sample estimate of the aggregated surface.
+// Miss = free-flight escape (transmittance 1, full environment). Backward replays the
+// same RNG stream (same seed) to reselect the same particle, then splats attribute
+// gradients to that single particle with weight 1 (no invOpacity, no compositing).
+// Additive: rayIntersect / rayIntersectBwd / sampleBrdfNextDirection(Bwd) untouched.
+// =====================================================================================
+
+template <bool EnableSelfOcclusionRejection>
+static __device__ __inline__ void rayIntersectStochastic(
+    const Ray& ray,
+    rayPayload& payload,
+    Sampler& sampler) {
+    constexpr float epsT = 1e-9;
+    const float2 minMaxT = intersectAABB(params.aabb, ray);
+    RayPayload hitPayload;
+
+#ifdef ENABLE_MIS
+    const float scatterPdf = payload.scatterPdf;
+    const float lightPdf   = payload.lightPdf;
+#endif
+    payload = rayPayload(ray, fmaxf(0.0f, minMaxT.x - epsT));
+#ifdef ENABLE_MIS
+    payload.scatterPdf = scatterPdf;
+    payload.lightPdf   = lightPdf;
+#endif
+
+    bool selected            = false;
+    float selectedHitT       = 0.f;
+    int32_t selectedParticle = -1;
+    Material selectedMaterial;
+    float3 selectedShadingnormal = make_float3(0.f);
+    float3 selectedNormal        = make_float3(0.f);
+
+    while (!selected && (payload.lastHitDistance <= minMaxT.y)) {
+        trace(hitPayload, payload.ray, payload.lastHitDistance + epsT, minMaxT.y + epsT);
+        if (hitPayload[0].particleId == RayHit::InvalidParticleId) {
+            break;
+        }
+
+#pragma unroll
+        for (int i = 0; i < PipelineParameters::MaxNumHitPerTrace; i++) {
+            const RayHit rayHit = hitPayload[i];
+            if (rayHit.particleId == RayHit::InvalidParticleId) {
+                break;
+            }
+            if (EnableSelfOcclusionRejection && isSelfOcclusionHit(rayHit, payload.ray, params.particleShadingNormal)) {
+                payload.lastHitDistance = fmaxf(payload.lastHitDistance, rayHit.distance);
+                continue;
+            }
+
+            float hitT = 0.f;
+            Material material;
+            float3 shadingnormal = make_float3(0.f);
+            float3 normal        = make_float3(0.f);
+            const float galpha = evalHitStochastic<PipelineParameters::ParticleKernelDegree, PipelineParameters::SurfelPrimitive>(
+                payload.ray.origin, payload.ray.direction,
+                rayHit.particleId,
+                params.particleDensity,
+                params.particleMaterial,
+                params.hitMinGaussianResponse,
+                params.alphaMinThreshold,
+                params.particleShadingNormal,
+                &hitT, &material,
+#ifdef ENABLE_NORMALS
+                &shadingnormal, &normal
+#else
+                nullptr, nullptr
+#endif
+            );
+
+            payload.lastHitDistance = fmaxf(payload.lastHitDistance, rayHit.distance);
+
+            // Free-flight acceptance. Short-circuit keeps RNG consumption deterministic
+            // (draw only when galpha > 0), so forward and backward stay aligned.
+            if (galpha > 0.0f && sampler.next_1d() < galpha) {
+                selected              = true;
+                selectedHitT          = hitT;
+                selectedParticle      = rayHit.particleId;
+                selectedMaterial      = material;
+                selectedShadingnormal = shadingnormal;
+                selectedNormal        = normal;
+                params.particleVisibility[rayHit.particleId] = 1;
+                break;
+            }
+        }
+    }
+
+    if (selected) {
+        payload.hit                   = 1;
+        payload.transmittance         = 0.0f;
+        payload.hitDistance           = selectedHitT;
+        payload.hitsCount             = 1.0f;
+        payload.normal                = selectedNormal;
+        payload.interactionParticleId = selectedParticle;
+        payload.interaction           = Interaction(
+            make_float3(
+                payload.ray.origin.x + payload.ray.direction.x * selectedHitT,
+                payload.ray.origin.y + payload.ray.direction.y * selectedHitT,
+                payload.ray.origin.z + payload.ray.direction.z * selectedHitT),
+            selectedShadingnormal,
+            selectedMaterial,
+            true);
+        payload.valid = false;
+    } else {
+        // Free-flight escape: fully transparent, environment contributes at full weight.
+        payload.transmittance = 1.0f;
+        payload.hit           = 0;
+        payload.valid         = true;
+    }
+}
+
+template <typename PipelineParams>
+static __device__ __inline__ void splatMaterialGradToParticleStochastic(
+    const int32_t particleId,
+    const MaterialGrad& materialGrad,
+    const PipelineParams& pipelineParams) {
+    if (particleId < 0) {
+        return;
+    }
+    Material& particleMaterialGrad = pipelineParams.particleMaterialGrad[particleId];
+    atomicAdd(&particleMaterialGrad.albedo.x, materialGrad.dAlbedo.x);
+    atomicAdd(&particleMaterialGrad.albedo.y, materialGrad.dAlbedo.y);
+    atomicAdd(&particleMaterialGrad.albedo.z, materialGrad.dAlbedo.z);
+    atomicAdd(&particleMaterialGrad.roughness, materialGrad.dRoughness);
+#ifdef ENABLE_METALLIC
+    atomicAdd(&particleMaterialGrad.metallic, materialGrad.dMetallic);
+#endif
+}
+
+template <typename PipelineParams>
+static __device__ __inline__ void PendingRayDirectionGradStochasticBwd(
+    pathPayload& path,
+    const PipelineParams& pipelineParams) {
+    PendingRayDirectionGrad& pending = path.pendingRayDirectionGrad;
+    if (!pending.valid) {
+        return;
+    }
+
+    const float dRoughness = dot(path.currentRayPayload.rayDirGrad, pending.dNextDirDRoughness);
+    const int32_t pendingParticle = pending.interactionParticleId;
+    path.pendingRayDirectionGrad.clear();
+    if (dRoughness == 0.0f) {
+        return;
+    }
+
+    MaterialGrad materialGrad;
+    materialGrad.dRoughness = dRoughness;
+    splatMaterialGradToParticleStochastic(pendingParticle, materialGrad, pipelineParams);
+}
+
+template <typename PipelineParams>
+static __device__ __inline__ void sampleBrdfNextDirectionStochasticBwd(
+    pathPayload& path,
+    Sampler& sampler,
+    PipelineParams& pipelineParams) {
+    const Ray currentRay = path.currentRayPayload.ray;
+    const Interaction currentInteraction = path.currentRayPayload.interaction;
+
+    float3 nextRayDirection = currentRay.direction;
+    float scatterPdf = 0.0f;
+    const FastBrdfValueGrad brdfThroughput = sample_material_fast_brdf_throughput_with_grads(
+        currentRay.direction,
+        sampler,
+        currentInteraction,
+        nextRayDirection,
+        scatterPdf);
+    const float3 nextPathThroughput = path.pathThroughput * brdfThroughput.value;
+    if (nextPathThroughput.x == 0.0f && nextPathThroughput.y == 0.0f && nextPathThroughput.z == 0.0f) {
+        path.pathThroughput = make_float3(0.0f);
+        path.active = 0u;
+        return;
+    }
+
+#ifdef ENABLE_MIS
+    const float lightPdf = lightSamplerPdf(currentInteraction.position, nextRayDirection);
+    const float nextThroughputMax = fmaxf(nextPathThroughput.x, fmaxf(nextPathThroughput.y, nextPathThroughput.z));
+    const bool firstBounceNeeActive = path.numBounces == 1u && nextThroughputMax >= 1e-4f;
+    if (firstBounceNeeActive) {
+        accumulateNeeGradBwd(path, currentRay, currentInteraction, pipelineParams);
+    }
+#endif
+
+    float3 brdfDependentLighting = path.accumulatedLighting;
+#ifdef ENABLE_MIS
+    if (firstBounceNeeActive) {
+        const float lightSideMis = misWeight(
+            path.emitterRayPayload.lightPdf,
+            path.emitterRayPayload.scatterPdf);
+        brdfDependentLighting -= path.emitterRayPayload.contribution * lightSideMis;
+    }
+#endif
+
+    const float3 dLoss_dBrdfNumerator = path.accumulatedLightingGrad * brdfDependentLighting;
+    const float3 dLoss_dBrdf = make_float3(
+        brdfThroughput.value.x > FastBrdfEps ? dLoss_dBrdfNumerator.x / brdfThroughput.value.x : 0.0f,
+        brdfThroughput.value.y > FastBrdfEps ? dLoss_dBrdfNumerator.y / brdfThroughput.value.y : 0.0f,
+        brdfThroughput.value.z > FastBrdfEps ? dLoss_dBrdfNumerator.z / brdfThroughput.value.z : 0.0f);
+    path.currentRayPayload.interaction.materialGrad.dAlbedo += dLoss_dBrdf * brdfThroughput.dBrdf_dAlbedo;
+    path.currentRayPayload.interaction.materialGrad.dRoughness += dot(dLoss_dBrdf, brdfThroughput.dBrdf_dRoughness);
+#ifdef ENABLE_METALLIC
+    path.currentRayPayload.interaction.materialGrad.dMetallic += dot(dLoss_dBrdf, brdfThroughput.dBrdf_dMetallic);
+#endif
+
+    path.pendingRayDirectionGrad.set(
+        currentRay,
+        1.0f - path.currentRayPayload.transmittance,
+        path.currentRayPayload.lastHitDistance,
+        brdfThroughput.dNextDir_dRoughness,
+        path.numBounces,
+        path.currentRayPayload.interactionParticleId);
+
+    // Splat the accumulated surface-material grad to the single sampled particle (weight 1).
+    splatMaterialGradToParticleStochastic(
+        path.currentRayPayload.interactionParticleId,
+        path.currentRayPayload.interaction.materialGrad,
+        pipelineParams);
+
+    path.pathThroughput = nextPathThroughput;
+    Ray nextRay(currentInteraction.position + safe_normalize(nextRayDirection) * kSelfOcclusionRayOriginOffset, nextRayDirection);
+    path.currentRayPayload = rayPayload(nextRay, 0.0f);
+#ifdef ENABLE_MIS
+    path.currentRayPayload.scatterPdf = scatterPdf;
+    path.currentRayPayload.lightPdf = lightPdf;
+#endif
+}

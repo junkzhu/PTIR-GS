@@ -1,0 +1,26 @@
+method: 3dgptir
+
+pipeline_type: fullStochastic
+backward_pipeline_type: ${render.pipeline_type}Bwd
+particle_kernel_degree: 4
+particle_kernel_density_clamping: true
+particle_kernel_min_response: 0.0113
+particle_kernel_min_alpha: ${div:1.0,255.0}
+particle_kernel_max_alpha: 0.99
+particle_radiance_sph_degree: 3
+primitive_type: instances
+min_transmittance: 0.001
+max_consecutive_bvh_update: 15
+visualize_lights: false
+enable_normals: true
+enable_hitcounts: true
+enable_mis: true
+filter_type: atrous #support "none", "atrous"
+enable_metallic: ${model.optimize_material_metallic}
+enable_kernel_timings: false
+hide_intermediate_outputs: false
+max_bounces: 3
+spp_chunk: 32
+inversion_spp: 32
+render_spp: 128
+relight_spp: 512
