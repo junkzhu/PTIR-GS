@@ -5,8 +5,8 @@ set -euo pipefail
 CUDA_DEVICES="0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DATA_ROOT="$REPO_ROOT/data/Synthetic4Relight"
-OUT_DIR="outputs/synthetic4relight"
+DATA_ROOT="$REPO_ROOT/data/RT4Relight"
+OUT_DIR="outputs/rt4relight"
 CONFIG_NAME="apps/nerf_synthetic_3dgrt.yaml"
 INVERSION_CONFIG_NAME="inversions/nerf_synthetic_3dgptir.yaml"
 INVERSION_OUT_DIR=""
@@ -16,9 +16,8 @@ RENDER_FRAME_STRIDE=1
 RUN_INVERSION=true
 RUN_RELIGHT=true
 FORCE_TRAIN=false
-RUN_PRECOMPILE=true
-DATASET_CONFIG="synthetic4relight"
-SCENES=(jugs hotdog chair airbaloons)
+DATASET_CONFIG="rt4relight"
+SCENES=(barrels bread plastica teacup)
 EXTRA_ARGS=()
 INVERSION_EXTRA_ARGS=()
 
@@ -28,7 +27,7 @@ Usage: $0 --cuda_device 0,1,2,3 [options] [-- extra hydra args]
 
 Options:
   --cuda_device DEVICES   Comma-separated GPU ids, e.g. 0,1,2,3.
-  --data_root PATH        Synthetic4Relight dataset root. Default: $DATA_ROOT
+  --data_root PATH        RT4Relight dataset root. Default: $DATA_ROOT
   --out_dir PATH          Output directory. Default: $OUT_DIR
   --config_name NAME      Hydra config name. Default: $CONFIG_NAME
   --inversion_config_name NAME
@@ -43,7 +42,6 @@ Options:
                           Render every Nth test frame after training/inversion and relight. Default: $RENDER_FRAME_STRIDE
   --no_relight            Do not run relight after PTIR inversion.
   --force_train           Run stage1 training even if ckpt_last.pt already exists.
-  --no_precompile         Skip PTIR native plugin precompile after it has been built once.
   --dataset_config NAME   Hydra dataset config. Default: $DATASET_CONFIG
   --scenes "A B C"        Space-separated scene list. Default: ${SCENES[*]}
   -h, --help              Show this help.
@@ -51,7 +49,7 @@ Options:
 Example:
   $0 --cuda_device 0,1,2,3
   $0 --cuda_device 0,1 -- n_iterations=7000
-  $0 --cuda_device 0 --scenes "hotdog" --no_inversion
+  $0 --cuda_device 0 --scenes "barrels" --no_inversion
 EOF
 }
 
@@ -109,10 +107,6 @@ while [[ $# -gt 0 ]]; do
             FORCE_TRAIN=true
             shift
             ;;
-        --no_precompile)
-            RUN_PRECOMPILE=false
-            shift
-            ;;
         --dataset_config)
             DATASET_CONFIG="$2"
             shift 2
@@ -147,18 +141,6 @@ if [[ "$RUN_INVERSION" != true ]]; then
     RUN_RELIGHT=false
 fi
 
-resolve_scene_path() {
-    local scene="$1"
-    case "$scene" in
-        airbaloons)
-            echo "$DATA_ROOT/air_baloons"
-            ;;
-        *)
-            echo "$DATA_ROOT/$scene"
-            ;;
-    esac
-}
-
 IFS=',' read -r -a GPU_IDS <<< "$CUDA_DEVICES"
 if [[ ${#GPU_IDS[@]} -eq 0 ]]; then
     echo "No CUDA devices provided."
@@ -171,6 +153,11 @@ export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$OUT_DIR/.cache}"
 precompile_inversion_plugin() {
     local gpu_id="$1"
     local log_file="$INVERSION_OUT_DIR/logs/precompile_3dgptir.log"
+    local lock_file="$TORCH_EXTENSIONS_DIR/precompile_3dgptir.lock"
+
+    mkdir -p "$TORCH_EXTENSIONS_DIR"
+    exec 9>"$lock_file"
+    flock 9
 
     echo "[$(date '+%F %T')] Precompiling PTIR native plugin on CUDA_VISIBLE_DEVICES=$gpu_id"
     {
@@ -193,6 +180,8 @@ setup_threedgptir(conf)
 PY
     } > "$log_file" 2>&1
     echo "[$(date '+%F %T')] PTIR native plugin is ready"
+    flock -u 9
+    exec 9>&-
 }
 
 find_latest_checkpoint() {
@@ -222,8 +211,7 @@ find_latest_inversion_checkpoint() {
 run_inversion() {
     local scene="$1"
     local gpu_id="$2"
-    local scene_path="$3"
-    local initialization_path="$4"
+    local initialization_path="$3"
     local log_file="$INVERSION_OUT_DIR/logs/inversion_${scene}.log"
 
     echo "[$(date '+%F %T')] Starting PTIR inversion scene=$scene on CUDA_VISIBLE_DEVICES=$gpu_id"
@@ -232,7 +220,7 @@ run_inversion() {
         echo "cuda_device=$gpu_id"
         echo "config=$INVERSION_CONFIG_NAME"
         echo "dataset=$DATASET_CONFIG"
-        echo "path=$scene_path"
+        echo "path=$DATA_ROOT/$scene"
         echo "initialization.path=$initialization_path"
         echo "out_dir=$INVERSION_OUT_DIR"
         echo "experiment_name=${scene}_inversion"
@@ -243,7 +231,7 @@ run_inversion() {
         CUDA_VISIBLE_DEVICES="$gpu_id" python train.py \
             --config-name "$INVERSION_CONFIG_NAME" \
             "dataset=$DATASET_CONFIG" \
-            "path=$scene_path" \
+            "path=$DATA_ROOT/$scene" \
             "initialization.path=$initialization_path" \
             "out_dir=$INVERSION_OUT_DIR" \
             "experiment_name=${scene}_inversion" \
@@ -294,11 +282,8 @@ run_scene() {
     local scene_args=()
     local checkpoint_path=""
     local inversion_checkpoint_path=""
-    local scene_path
 
-    scene_path="$(resolve_scene_path "$scene")"
-
-    if [[ "$scene" == "jugs" || "$scene" == "hotdog" || "$scene" == "chair" || "$scene" == "airbaloons" ]]; then
+    if [[ "$scene" == "bread" || "$scene" == "teacup" || "$scene" == "barrels" || "$scene" == "plastica" ]]; then
         scene_args+=("loss.use_normal_prior_regularization=true")
     fi
 
@@ -313,7 +298,7 @@ run_scene() {
             echo "cuda_device=$gpu_id"
             echo "config=$CONFIG_NAME"
             echo "dataset=$DATASET_CONFIG"
-            echo "path=$scene_path"
+            echo "path=$DATA_ROOT/$scene"
             echo "out_dir=$OUT_DIR"
             echo "experiment_name=$scene"
             echo "render_frame_stride=$RENDER_FRAME_STRIDE"
@@ -323,7 +308,7 @@ run_scene() {
             CUDA_VISIBLE_DEVICES="$gpu_id" python train.py \
                 --config-name "$CONFIG_NAME" \
                 "dataset=$DATASET_CONFIG" \
-                "path=$scene_path" \
+                "path=$DATA_ROOT/$scene" \
                 "out_dir=$OUT_DIR" \
                 "experiment_name=$scene" \
                 "render_frame_stride=$RENDER_FRAME_STRIDE" \
@@ -339,7 +324,7 @@ run_scene() {
             echo "[$(date '+%F %T')] No stage1 checkpoint found for scene=$scene; skipping PTIR inversion."
             return 1
         fi
-        run_inversion "$scene" "$gpu_id" "$scene_path" "$checkpoint_path"
+        run_inversion "$scene" "$gpu_id" "$checkpoint_path"
         if [[ "$RUN_RELIGHT" == true ]]; then
             inversion_checkpoint_path="$(find_latest_inversion_checkpoint "$scene" || true)"
             if [[ -z "$inversion_checkpoint_path" ]]; then
@@ -351,7 +336,7 @@ run_scene() {
     fi
 }
 
-if [[ "$RUN_INVERSION" == true && "$RUN_PRECOMPILE" == true ]]; then
+if [[ "$RUN_INVERSION" == true ]]; then
     precompile_inversion_plugin "${GPU_IDS[0]}"
 fi
 
@@ -370,4 +355,4 @@ for idx in "${!SCENES[@]}"; do
 done
 
 wait
-echo "All Synthetic4Relight training jobs finished. Logs: $OUT_DIR/logs"
+echo "All RT4Relight training jobs finished. Logs: $OUT_DIR/logs"

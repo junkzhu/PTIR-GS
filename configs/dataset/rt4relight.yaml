@@ -1,0 +1,4 @@
+type: nerf
+normal: true
+material: true
+relight_env: ["courtyard", "forest"]
