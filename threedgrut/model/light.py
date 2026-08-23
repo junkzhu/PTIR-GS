@@ -514,7 +514,12 @@ def _radiance_to_sg_raw(radiance: torch.Tensor, gamma: float) -> torch.Tensor:
 
 
 def _sg_raw_to_radiance(raw: torch.Tensor, gamma: float) -> torch.Tensor:
-    return torch.exp(F.softplus(raw) / float(gamma)) - 1.0
+    # 80 is below float32 overflow while leaving any practical HDR amplitude
+    # unchanged. The clamp also stops invalid optimizer excursions cleanly.
+    log_radiance = torch.clamp(F.softplus(raw) / float(gamma), max=80.0)
+    return torch.nan_to_num(
+        torch.expm1(log_radiance), nan=0.0, posinf=5.54062238439351e34
+    )
 
 
 def _fibonacci_sphere_directions(
@@ -612,7 +617,7 @@ def _alternating_sg_sharpness(
 
 
 class SphericalGaussianEnvironment(torch.nn.Module):
-    """Learnable SG lighting evaluated into a 2D environment map."""
+    """Learnable SG lighting with native evaluation and optional envmap export."""
 
     DEFAULT_NUM_LOBES = 24
     DEFAULT_GAMMA = 0.3
@@ -620,6 +625,10 @@ class SphericalGaussianEnvironment(torch.nn.Module):
     DEFAULT_SHARPNESS_HIGH = 20.0
     DEFAULT_RAW_AMPLITUDE = -3.5
     DEFAULT_MIN_SHARPNESS = 1.0e-4
+    DEFAULT_MAX_SHARPNESS = 1.0e4
+    NATIVE_PARAMETER_SIZE = 7
+    NATIVE_SAMPLING_SIZE = 2
+    LUMINANCE_WEIGHTS = (0.2126, 0.7152, 0.0722)
 
     def __init__(
         self,
@@ -629,6 +638,7 @@ class SphericalGaussianEnvironment(torch.nn.Module):
         sharpness: float | Sequence[float] | torch.Tensor | None = None,
         init_radiance: float | Sequence[float] | torch.Tensor = 0.5,
         min_sharpness: float = DEFAULT_MIN_SHARPNESS,
+        max_sharpness: float = DEFAULT_MAX_SHARPNESS,
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.float32,
         raw_amplitudes: torch.Tensor | None = None,
@@ -646,12 +656,18 @@ class SphericalGaussianEnvironment(torch.nn.Module):
             )
         self.gamma = float(gamma)
         self.min_sharpness = float(min_sharpness)
+        self.max_sharpness = float(max_sharpness)
 
         if self.gamma <= 0.0:
             raise ValueError(f"gamma must be positive, got {gamma}.")
         if self.min_sharpness <= 0.0:
             raise ValueError(
                 f"min_sharpness must be positive, got {min_sharpness}."
+            )
+        if self.max_sharpness <= self.min_sharpness:
+            raise ValueError(
+                "max_sharpness must be greater than min_sharpness, got "
+                f"{self.max_sharpness} <= {self.min_sharpness}."
             )
 
         if directions is None:
@@ -751,6 +767,9 @@ class SphericalGaussianEnvironment(torch.nn.Module):
             min_sharpness=float(
                 config.get("min_sharpness", cls.DEFAULT_MIN_SHARPNESS)
             ),
+            max_sharpness=float(
+                config.get("max_sharpness", cls.DEFAULT_MAX_SHARPNESS)
+            ),
             device=device,
             dtype=dtype,
         )
@@ -800,6 +819,9 @@ class SphericalGaussianEnvironment(torch.nn.Module):
             min_sharpness=float(
                 config.get("min_sharpness", cls.DEFAULT_MIN_SHARPNESS)
             ),
+            max_sharpness=float(
+                config.get("max_sharpness", cls.DEFAULT_MAX_SHARPNESS)
+            ),
             device=device,
             dtype=dtype,
             raw_amplitudes=raw_amplitudes,
@@ -815,25 +837,198 @@ class SphericalGaussianEnvironment(torch.nn.Module):
             "resolution": [self.height, self.width],
             "gamma": self.gamma,
             "min_sharpness": self.min_sharpness,
+            "max_sharpness": self.max_sharpness,
         }
 
     def amplitudes(self) -> torch.Tensor:
         return _sg_raw_to_radiance(self.raw_amplitudes, self.gamma)
 
     def sharpness(self) -> torch.Tensor:
-        return F.softplus(self.raw_sharpness) + self.min_sharpness
+        sharpness = F.softplus(self.raw_sharpness) + self.min_sharpness
+        sharpness = torch.nan_to_num(
+            sharpness,
+            nan=self.min_sharpness,
+            posinf=self.max_sharpness,
+            neginf=self.min_sharpness,
+        )
+        return torch.clamp(
+            sharpness,
+            min=self.min_sharpness,
+            max=self.max_sharpness,
+        )
 
     def normalized_directions(self) -> torch.Tensor:
-        return F.normalize(self.directions, dim=-1)
+        directions = torch.nan_to_num(
+            self.directions, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        lengths = torch.linalg.vector_norm(directions, dim=-1, keepdim=True)
+        normalized = directions / torch.clamp(lengths, min=1.0e-8)
+        fallback = torch.zeros_like(normalized)
+        fallback[..., 1] = 1.0
+        return torch.where(lengths > 1.0e-8, normalized, fallback)
+
+    def native_parameters(self) -> torch.Tensor:
+        """Pack current differentiable SGs as [axis.xyz, lambda, amplitude.rgb]."""
+        return torch.cat(
+            [
+                self.normalized_directions(),
+                self.sharpness().reshape(-1, 1),
+                self.amplitudes(),
+            ],
+            dim=-1,
+        ).contiguous()
+
+    @staticmethod
+    def normalization_from_sharpness(sharpness: torch.Tensor) -> torch.Tensor:
+        """Analytical integral of exp(lambda * (mu dot omega - 1))."""
+        sharpness = torch.clamp(
+            torch.nan_to_num(sharpness, nan=1.0e-8, posinf=1.0e4, neginf=1.0e-8),
+            min=1.0e-8,
+            max=1.0e4,
+        )
+        return 2.0 * torch.pi * (-torch.expm1(-2.0 * sharpness)) / sharpness
+
+    def native_sampling_distribution(
+        self, parameters: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Build the current detached [Z_k, alpha_k] SG proposal snapshot.
+
+        This intentionally does not cache values: optimized amplitudes and
+        sharpnesses must produce a fresh proposal for every renderer forward.
+        Sampling/PDF terms remain detached, matching the existing replay
+        estimator's treatment of its envmap alias table.
+        """
+        if parameters is None:
+            parameters = self.native_parameters()
+        if parameters.ndim != 2 or parameters.shape[-1] != self.NATIVE_PARAMETER_SIZE:
+            raise ValueError(
+                "native SG parameters must have shape [K, 7], got "
+                f"{tuple(parameters.shape)}."
+            )
+
+        with torch.no_grad():
+            snapshot = parameters.detach()
+            normalization = self.normalization_from_sharpness(snapshot[:, 3])
+            luminance_weights = snapshot.new_tensor(self.LUMINANCE_WEIGHTS)
+            luminance = torch.sum(
+                torch.clamp(torch.nan_to_num(snapshot[:, 4:7]), min=0.0)
+                * luminance_weights,
+                dim=-1,
+            )
+            lobe_weights = torch.nan_to_num(
+                luminance * normalization, nan=0.0, posinf=0.0, neginf=0.0
+            )
+            total_weight = torch.sum(lobe_weights)
+            tiny = torch.finfo(snapshot.dtype).tiny
+            safe_total = torch.clamp(total_weight, min=tiny)
+            weighted_alpha = lobe_weights / safe_total
+            uniform_alpha = torch.full_like(
+                weighted_alpha, 1.0 / float(max(1, snapshot.shape[0]))
+            )
+            valid_total = torch.isfinite(total_weight) & (total_weight > tiny)
+            alpha = torch.where(valid_total, weighted_alpha, uniform_alpha)
+            return torch.stack([normalization, alpha], dim=-1).contiguous()
+
+    def evaluate_directions(self, directions: torch.Tensor) -> torch.Tensor:
+        """Evaluate the SG sum directly for arbitrary directions."""
+        directions = F.normalize(torch.nan_to_num(directions), dim=-1)
+        parameters = self.native_parameters()
+        dots = torch.matmul(directions, parameters[:, :3].transpose(0, 1))
+        basis = torch.exp(parameters[:, 3] * (torch.clamp(dots, -1.0, 1.0) - 1.0))
+        return torch.matmul(basis, parameters[:, 4:7])
+
+    def mixture_pdf(
+        self,
+        directions: torch.Tensor,
+        parameters: torch.Tensor | None = None,
+        sampling_distribution: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Evaluate the exact full SG-mixture density for validation/debugging."""
+        parameters = self.native_parameters() if parameters is None else parameters
+        sampling_distribution = (
+            self.native_sampling_distribution(parameters)
+            if sampling_distribution is None
+            else sampling_distribution
+        )
+        directions = F.normalize(torch.nan_to_num(directions), dim=-1)
+        dots = torch.matmul(directions, parameters[:, :3].transpose(0, 1))
+        basis = torch.exp(parameters[:, 3] * (torch.clamp(dots, -1.0, 1.0) - 1.0))
+        component_pdf = basis / torch.clamp(
+            sampling_distribution[:, 0], min=torch.finfo(parameters.dtype).tiny
+        )
+        return torch.matmul(component_pdf, sampling_distribution[:, 1])
+
+    @torch.no_grad()
+    def sample_directions(
+        self,
+        num_samples: int,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reference native SG sampler used by numerical validation/debugging."""
+        if num_samples <= 0:
+            raise ValueError(f"num_samples must be positive, got {num_samples}.")
+        parameters = self.native_parameters().detach()
+        sampling = self.native_sampling_distribution(parameters)
+        random_values = torch.rand(
+            (num_samples, 3),
+            dtype=parameters.dtype,
+            device=parameters.device,
+            generator=generator,
+        )
+        cumulative = torch.cumsum(sampling[:, 1], dim=0)
+        cumulative[-1] = 1.0
+        selected = torch.searchsorted(
+            cumulative, random_values[:, 0].contiguous()
+        ).clamp_max(parameters.shape[0] - 1)
+        axis = parameters[selected, :3]
+        sharpness = parameters[selected, 3]
+
+        one_minus_exp_negative_two_lambda = -torch.expm1(-2.0 * sharpness)
+        one_minus_inverse_cdf = torch.clamp(
+            (1.0 - random_values[:, 1]) * one_minus_exp_negative_two_lambda,
+            max=1.0 - torch.finfo(parameters.dtype).eps,
+        )
+        log_inverse_cdf = torch.log1p(-one_minus_inverse_cdf)
+        concentrated_cos_theta = 1.0 + log_inverse_cdf / torch.clamp(
+            sharpness, min=1.0e-8
+        )
+        uniform_cos_theta = -1.0 + 2.0 * random_values[:, 1]
+        cos_theta = torch.where(
+            sharpness < 1.0e-6, uniform_cos_theta, concentrated_cos_theta
+        ).clamp(-1.0, 1.0)
+        sin_theta = torch.sqrt(torch.clamp(1.0 - cos_theta.square(), min=0.0))
+        phi = 2.0 * torch.pi * random_values[:, 2]
+
+        helper_z = torch.zeros_like(axis)
+        helper_z[:, 2] = 1.0
+        helper_x = torch.zeros_like(axis)
+        helper_x[:, 0] = 1.0
+        helper = torch.where((axis[:, 2].abs() < 0.999).unsqueeze(-1), helper_z, helper_x)
+        tangent = F.normalize(torch.cross(helper, axis, dim=-1), dim=-1)
+        bitangent = torch.cross(axis, tangent, dim=-1)
+        directions = F.normalize(
+            tangent * (sin_theta * torch.cos(phi)).unsqueeze(-1)
+            + bitangent * (sin_theta * torch.sin(phi)).unsqueeze(-1)
+            + axis * cos_theta.unsqueeze(-1),
+            dim=-1,
+        )
+        return directions, self.mixture_pdf(directions, parameters, sampling)
+
+    def estimate_power(self) -> torch.Tensor:
+        """Analytical luminance integral used by the top-level light sampler."""
+        parameters = self.native_parameters()
+        luminance_weights = parameters.new_tensor(self.LUMINANCE_WEIGHTS)
+        luminance = torch.sum(parameters[:, 4:7] * luminance_weights, dim=-1)
+        return torch.sum(
+            luminance * self.normalization_from_sharpness(parameters[:, 3])
+        )
 
     def forward(self) -> torch.Tensor:
-        view_dirs = self.texel_directions.reshape(-1, 3)
-        lobe_dirs = self.normalized_directions()
-        dot_products = torch.matmul(view_dirs, lobe_dirs.transpose(0, 1))
-        lobes = torch.exp(self.sharpness().reshape(1, -1) * (dot_products - 1.0))
-        rgb = torch.matmul(lobes, self.amplitudes()).reshape(
-            self.height, self.width, 3
-        )
+        # Optional visualization/debug/export path. Native PTIR rendering calls
+        # native_parameters() and never needs this rasterization.
+        rgb = self.evaluate_directions(
+            self.texel_directions.reshape(-1, 3)
+        ).reshape(self.height, self.width, 3)
         alpha = torch.ones(
             self.height,
             self.width,
@@ -1463,9 +1658,11 @@ def create_environment(
 
 
 def estimate_environment_power(
-    environment: torch.Tensor | EnvironmentLight | None,
+    environment: torch.Tensor | EnvironmentLight | SphericalGaussianEnvironment | None,
     environment_type: str = "2d",
 ) -> torch.Tensor | None:
+    if isinstance(environment, SphericalGaussianEnvironment):
+        return environment.estimate_power()
     if isinstance(environment, EnvironmentLight):
         return environment.estimate_power()
     if environment is None:
@@ -1505,7 +1702,10 @@ def estimate_light_power(packed_lights: torch.Tensor) -> torch.Tensor:
 
 
 def build_light_alias_table(
-    environment: torch.Tensor | EnvironmentLight | None = None,
+    environment: torch.Tensor
+    | EnvironmentLight
+    | SphericalGaussianEnvironment
+    | None = None,
     environment_type: str = "2d",
     lights: torch.Tensor | None = None,
     mesh_powers: torch.Tensor | Sequence[float] | None = None,
@@ -1515,18 +1715,23 @@ def build_light_alias_table(
     entries_index = []
     entries_weight = []
 
-    environment_light = (
-        environment
-        if isinstance(environment, EnvironmentLight)
-        else EnvironmentLight(
-            environment=environment,
-            environment_type=environment_type,
+    if isinstance(environment, SphericalGaussianEnvironment):
+        environment_light_index = 0
+        env_power = environment.estimate_power().detach()
+    else:
+        environment_light = (
+            environment
+            if isinstance(environment, EnvironmentLight)
+            else EnvironmentLight(
+                environment=environment,
+                environment_type=environment_type,
+            )
         )
-    )
-    env_power = environment_light.estimate_power()
+        environment_light_index = environment_light.light_index
+        env_power = environment_light.estimate_power()
     if env_power is not None:
         entries_type.append(LIGHT_TYPE_ENV)
-        entries_index.append(environment_light.light_index)
+        entries_index.append(environment_light_index)
         entries_weight.append(env_power)
 
     packed_lights = (

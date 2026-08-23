@@ -154,6 +154,8 @@ class Tracer:
             mog_mmet,
             environment,
             environment_alias_table,
+            sg_environment,
+            sg_sampling_distribution,
             light_buffers,
             render_opts,
             sph_degree,
@@ -198,6 +200,8 @@ class Tracer:
                 mog_snrm,
                 environment,
                 environment_alias_table,
+                sg_environment,
+                sg_sampling_distribution,
                 lights,
                 light_alias_table,
                 mesh_light_vertices,
@@ -229,6 +233,8 @@ class Tracer:
                 mog_snrm,
                 environment,
                 environment_alias_table,
+                sg_environment,
+                sg_sampling_distribution,
                 lights,
                 light_alias_table,
                 mesh_light_vertices,
@@ -295,6 +301,8 @@ class Tracer:
                 mog_snrm,
                 environment,
                 environment_alias_table,
+                sg_environment,
+                sg_sampling_distribution,
                 lights,
                 light_alias_table,
                 mesh_light_vertices,
@@ -311,6 +319,7 @@ class Tracer:
                 mog_sph_grd,
                 mog_sn_grd,
                 environment_grd,
+                sg_environment_grd,
             ) = ctx.tracer_wrapper.trace_bwd(
                 frame_id,
                 ray_to_world,
@@ -332,6 +341,8 @@ class Tracer:
                 mog_snrm,
                 environment,
                 environment_alias_table,
+                sg_environment,
+                sg_sampling_distribution,
                 lights,
                 light_alias_table,
                 mesh_light_vertices,
@@ -375,6 +386,8 @@ class Tracer:
                 mog_mrgh_grd,
                 mog_mmet_grd,
                 environment_grd,
+                None,
+                sg_environment_grd,
                 None,
                 None,
                 None,
@@ -434,6 +447,24 @@ class Tracer:
         self._logged_spp_configs = set()
         self.pred_pbr_filter = Filter(self.conf.render.get("filter_type", "none"))
         self.visualize_lights = bool(self.conf.render.get("visualize_lights", False))
+        self.max_bounces = int(self.conf.render.max_bounces)
+        if self.max_bounces < 0:
+            raise ValueError(
+                f"render.max_bounces must be >= 0, got {self.max_bounces}"
+            )
+        self.render_bounces = int(
+            self.conf.render.get("render_bounces", self.max_bounces)
+        )
+        if self.render_bounces < 0:
+            raise ValueError(
+                "render.render_bounces must be >= 0, "
+                f"got {self.render_bounces}"
+            )
+        # The native tracer counts the primary ray as the first path segment,
+        # while the configured bounce limits count only reflection/path bounces.
+        self.environment_type = str(
+            self.conf.get("environment", {}).get("type", "2d")
+        ).lower()
 
         logger.info(
             f'🔆 Creating threedgptir Optix tracing pipeline.. Using CUDA path: "{torch.utils.cpp_extension.CUDA_HOME}"'
@@ -461,12 +492,41 @@ class Tracer:
                 self.conf.model.get("optimize_material_metallic", False),
             ),
             self.visualize_lights,
+            self.conf.render.russian_roulette,
+            self.conf.render.discrete_model,
         )
 
         self.frame_timer = (
             CudaTimer() if self.conf.render.enable_kernel_timings else None
         )
+        self.sg_distribution_timer = (
+            CudaTimer() if self.conf.render.enable_kernel_timings else None
+        )
         self.timings = {}
+
+    def _uses_native_sg(self, gaussians) -> bool:
+        environment = getattr(gaussians, "environment", None)
+        return self.environment_type == "spherical_gaussian" and hasattr(
+            environment, "native_parameters"
+        )
+
+    def _prepare_native_sg(self, gaussians, device: torch.device):
+        environment = getattr(gaussians, "environment", None)
+        if not self._uses_native_sg(gaussians):
+            return (
+                torch.empty((0, 7), dtype=torch.float32, device=device),
+                torch.empty((0, 2), dtype=torch.float32, device=device),
+            )
+
+        parameters = environment.native_parameters().to(
+            device=device, dtype=torch.float32
+        ).contiguous()
+        if self.sg_distribution_timer is not None:
+            self.sg_distribution_timer.start()
+        sampling_distribution = environment.native_sampling_distribution(parameters)
+        if self.sg_distribution_timer is not None:
+            self.sg_distribution_timer.end()
+        return parameters, sampling_distribution
 
     def _required_train_output_keys(self) -> set[str]:
         keys = {
@@ -531,6 +591,10 @@ class Tracer:
         else:
             spp = self.conf.render.render_spp
         return max(1, int(spp))
+
+    def _get_native_max_bounces(self, train: bool) -> int:
+        max_bounces = self.max_bounces if train else self.render_bounces
+        return max_bounces + 1
 
     def _get_spp_chunk(self, spp: int) -> int:
         return min(spp, max(1, int(self.conf.render.get("spp_chunk", spp))))
@@ -752,6 +816,7 @@ class Tracer:
 
             base_batch = gpu_batch.rays_dir.shape[0]
             spp = self._get_spp(train)
+            native_max_bounces = self._get_native_max_bounces(train)
             if spp > 1 and not self._can_expand_spp(gpu_batch):
                 self._warn_spp_fallback(
                     "batch has no supported pinhole intrinsics/pixel_coords"
@@ -793,6 +858,56 @@ class Tracer:
             mog_visibility = None
             total_spp = 0
 
+            native_sg_enabled = self._uses_native_sg(gaussians)
+            self.timings.pop("sg_sampling_distribution_update", None)
+            sg_environment, sg_sampling_distribution = self._prepare_native_sg(
+                gaussians, gpu_batch.rays_dir.device
+            )
+            if native_sg_enabled:
+                # Native rendering must not rasterize SGs into an envmap.
+                environment = torch.empty(
+                    (0, 0, 4), dtype=torch.float32, device=gpu_batch.rays_dir.device
+                )
+                environment_alias_table = torch.empty(
+                    0, dtype=torch.float32, device=gpu_batch.rays_dir.device
+                )
+            else:
+                environment = gaussians.get_environment()
+                if environment is None:
+                    environment = torch.empty(
+                        (0, 0, 4),
+                        dtype=torch.float32,
+                        device=gpu_batch.rays_dir.device,
+                    )
+                alias_table = getattr(gaussians, "environment_alias_table", None)
+                if alias_table is None:
+                    environment_alias_table = torch.empty(
+                        0, dtype=torch.float32, device=gpu_batch.rays_dir.device
+                    )
+                else:
+                    environment_alias_table = (
+                        torch.concat(
+                            [
+                                alias_table.prob.reshape(
+                                    1, alias_table.height, alias_table.width
+                                ),
+                                alias_table.alias.reshape(
+                                    1, alias_table.height, alias_table.width
+                                ).to(dtype=torch.float32),
+                                alias_table.pdf.reshape(
+                                    1, alias_table.height, alias_table.width
+                                ),
+                            ],
+                            dim=0,
+                        )
+                        .to(device=gpu_batch.rays_dir.device)
+                        .contiguous()
+                    )
+            light_buffers = LightBuffers.from_batch(
+                gpu_batch,
+                device=gpu_batch.rays_dir.device,
+            )
+
             def accumulate_output(name: str, value: torch.Tensor) -> None:
                 if accumulation_keys is not None and name not in accumulation_keys:
                     return
@@ -816,40 +931,6 @@ class Tracer:
                     frame_id + spp_start,
                     jitter=chunk_jitter,
                 )
-                environment = gaussians.get_environment()
-                if environment is None:
-                    environment = torch.empty(
-                        (0, 0, 4), dtype=torch.float32, device=rays_dir.device
-                    )
-                alias_table = getattr(gaussians, "environment_alias_table", None)
-                if alias_table is None:
-                    environment_alias_table = torch.empty(
-                        0, dtype=torch.float32, device=rays_dir.device
-                    )
-                else:
-                    environment_alias_table = (
-                        torch.concat(
-                            [
-                                alias_table.prob.reshape(
-                                    1, alias_table.height, alias_table.width
-                                ),
-                                alias_table.alias.reshape(
-                                    1, alias_table.height, alias_table.width
-                                ).to(dtype=torch.float32),
-                                alias_table.pdf.reshape(
-                                    1, alias_table.height, alias_table.width
-                                ),
-                            ],
-                            dim=0,
-                        )
-                        .to(device=rays_dir.device)
-                        .contiguous()
-                    )
-                light_buffers = LightBuffers.from_batch(
-                    gpu_batch,
-                    device=rays_dir.device,
-                )
-
                 (
                     chunk_pred_rgb,
                     chunk_pred_opacity,
@@ -881,6 +962,8 @@ class Tracer:
                     gaussians.get_material_metallic().contiguous(),
                     environment,
                     environment_alias_table,
+                    sg_environment,
+                    sg_sampling_distribution,
                     light_buffers,
                     int(
                         Tracer.RenderOpts.INDIRECT
@@ -889,7 +972,7 @@ class Tracer:
                     ),
                     gaussians.n_active_features,
                     self.conf.render.min_transmittance,
-                    self.conf.render.get("max_bounces", 3),
+                    native_max_bounces,
                 )
 
                 chunk_pred_rgb, chunk_pred_opacity = gaussians.background(
@@ -941,6 +1024,10 @@ class Tracer:
 
         if self.frame_timer is not None:
             self.timings["forward_render"] = self.frame_timer.timing()
+        if native_sg_enabled and self.sg_distribution_timer is not None:
+            self.timings["sg_sampling_distribution_update"] = (
+                self.sg_distribution_timer.timing()
+            )
 
         output_keys = (
             "pred_rgb",

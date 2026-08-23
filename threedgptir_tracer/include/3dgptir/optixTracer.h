@@ -107,7 +107,9 @@ protected:
         bool enableHitCounts,
         bool enableMIS,
         bool enableMetallic,
-        bool enableVisualizeLights);
+        bool enableVisualizeLights,
+        bool enableRussianRoulette,
+        bool enableDiscreteModel);
     void createPipeline(const OptixDeviceContext context,
                         const std::string& path,
                         const std::string& dependencies_path,
@@ -141,7 +143,9 @@ public:
         bool enableHitCounts,
         bool enableMIS,
         bool enableMetallic,
-        bool enableVisualizeLights);
+        bool enableVisualizeLights,
+        bool enableRussianRoulette,
+        bool enableDiscreteModel);
 
     virtual ~OptixTracer();
 
@@ -156,6 +160,8 @@ public:
         torch::Tensor particleShadingNormal,
         torch::Tensor environment,
         torch::Tensor environmentAliasTable,
+        torch::Tensor sgEnvironment,
+        torch::Tensor sgSamplingDistribution,
         torch::Tensor lights,
         torch::Tensor lightAliasTable,
         torch::Tensor meshLightVertices,
@@ -167,7 +173,7 @@ public:
         float minTransmittance,
         uint32_t maxBounces);
 
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> virtual traceBwd(
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> virtual traceBwd(
         uint32_t frameNumber,
         torch::Tensor rayToWorld,
         torch::Tensor rayOri,
@@ -188,6 +194,8 @@ public:
         torch::Tensor particleShadingNormal,
         torch::Tensor environment,
         torch::Tensor environmentAliasTable,
+        torch::Tensor sgEnvironment,
+        torch::Tensor sgSamplingDistribution,
         torch::Tensor lights,
         torch::Tensor lightAliasTable,
         torch::Tensor meshLightVertices,

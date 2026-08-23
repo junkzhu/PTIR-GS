@@ -76,6 +76,13 @@ struct Sampler {
         return static_cast<float>(u) * (1.0f / 16777216.0f);
     }
 
+    __host__ __device__ __forceinline__ Sampler fork(unsigned long long streamOffset) const {
+        Sampler forked = *this;
+        forked.inc += streamOffset << 1u;
+        forked.next_u32(); // Make the next value depend on the forked stream.
+        return forked;
+    }
+
 #if defined(__CUDACC__) || defined(__OPTIX__)
     __host__ __device__ __forceinline__ float3 next_3d() {
         return make_float3(next_1d(), next_1d(), next_1d());

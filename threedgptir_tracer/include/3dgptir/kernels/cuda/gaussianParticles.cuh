@@ -340,6 +340,14 @@ static inline __device__ float particleScaledResponse(float grayDist, float modu
     }
 }
 
+struct ParticleHit {
+    float opacityWeight;
+    float hitT;
+    Material material;
+    float3 shadingnormal;
+    float3 normal;
+};
+
 template <int ParticleKernelDegree = 4, bool SurfelPrimitive = false>
 __device__ inline bool processHit(
     const float3& rayOrigin,
@@ -358,7 +366,8 @@ __device__ inline bool processHit(
     float* depthSecondMoment,
     Material* material,
     float3* shadingnormal,
-    float3* normal) {
+    float3* normal,
+    ParticleHit* particleHit) {
     float3 particlePosition;
     float3 particleScale;
     float33 particleRotation;
@@ -403,6 +412,14 @@ __device__ inline bool processHit(
         const float3 grds = particleScale * grd * (SurfelPrimitive ? -gro.z / grd.z : dot(grd, -1 * gro));
         const float hitT  = sqrtf(dot(grds, grds));
 
+        if (particleHit) {
+            particleHit->opacityWeight = weight;
+            particleHit->hitT = hitT;
+            particleHit->material = Material(particleAlbedo, particleRoughness, particleMetallic);
+            particleHit->shadingnormal = make_float3(0.f);
+            particleHit->normal = make_float3(0.f);
+        }
+
         // radiance from sph coefficients
         float3 sphCoefficients[SPH_MAX_NUM_COEFFS];
         fetchParticleSphCoefficients(
@@ -421,18 +438,37 @@ __device__ inline bool processHit(
         *depth += hitT * weight;
         *depthSecondMoment += hitT * hitT * weight;
 
-        if (normal) {
-            if (shadingnormal) {
-                const float3 particleShadingNormal = make_float3(
+        const bool writeParticleNormal =
+#ifdef ENABLE_NORMALS
+            particleHit != nullptr;
+#else
+            false;
+#endif
+        if (normal || writeParticleNormal) {
+            if (shadingnormal || writeParticleNormal) {
+                const float3 particleShadingnormal = make_float3(
                     particlesShadingNormal[particleIdx * 3 + 0],
                     particlesShadingNormal[particleIdx * 3 + 1],
                     particlesShadingNormal[particleIdx * 3 + 2]);
-                *shadingnormal += weight * particleShadingNormal;
+                if (shadingnormal) {
+                    *shadingnormal += weight * particleShadingnormal;
+                }
+                if (writeParticleNormal) {
+                    particleHit->shadingnormal = particleShadingnormal;
+                }
             }
 
             constexpr float ellispoidSqRadius = 9.0f;
             const float3 particleScaleRotated = (particleRotation * particleScale);
-            *normal += weight * (SurfelPrimitive ? make_float3(0, 0, (grd.z > 0 ? 1 : -1) * particleScaleRotated.z) : safe_normalize((gro + grd * (dot(grd, -1 * gro) - sqrtf(ellispoidSqRadius - grayDist))) * particleScaleRotated));
+            const float3 particleNormal = SurfelPrimitive
+                ? make_float3(0, 0, (grd.z > 0 ? 1 : -1) * particleScaleRotated.z)
+                : safe_normalize((gro + grd * (dot(grd, -1 * gro) - sqrtf(ellispoidSqRadius - grayDist))) * particleScaleRotated);
+            if (normal) {
+                *normal += weight * particleNormal;
+            }
+            if (writeParticleNormal) {
+                particleHit->normal = particleNormal;
+            }
         }
     }
 

@@ -93,7 +93,7 @@ if __name__ == "__main__":
         metavar="KEY=VALUE",
         help=(
             "Hydra/OmegaConf-style checkpoint config override. May be passed "
-            "multiple times, e.g. --override render.max_bounces=10."
+            "multiple times, e.g. --override render.render_bounces=10."
         ),
     )
     args = parser.parse_args()

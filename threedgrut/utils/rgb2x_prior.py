@@ -112,9 +112,21 @@ def _srgb_to_linear(image_chw: torch.Tensor) -> torch.Tensor:
 
 
 def _camera_normal_to_world(
-    normal_chw: torch.Tensor, c2w: torch.Tensor
+    normal_chw: torch.Tensor,
+    c2w: torch.Tensor,
+    *,
+    c2w_uses_opengl_axes: bool,
 ) -> torch.Tensor:
+    """Transform an RGB2X OpenGL camera normal into world space.
+
+    Raw NeRF/Blender camera-to-world matrices use the same right/up/back axes
+    as RGB2X, while dataset poses standardized by 3DGRUT use OpenCV-style
+    right/down/front axes. Only the latter require a Y/Z flip.
+    """
     normal_chw = normal_chw * 2.0 - 1.0
+    if not c2w_uses_opengl_axes:
+        opengl_to_opencv = normal_chw.new_tensor((1.0, -1.0, -1.0)).view(3, 1, 1)
+        normal_chw = normal_chw * opengl_to_opencv
     rotation = c2w[:3, :3].to(device=normal_chw.device, dtype=normal_chw.dtype)
     normal_hwc = normal_chw.permute(1, 2, 0)
     normal_world = torch.einsum("ij,hwj->hwi", rotation, normal_hwc)
@@ -248,6 +260,11 @@ def generate_rgb2x_priors(
 
     image_paths = [Path(path).expanduser().resolve() for path in image_paths]
     raw_nerf_c2ws = _load_nerf_raw_camera_to_worlds(image_paths, dataset_root)
+    raw_nerf_image_paths = {
+        image_path
+        for image_path, raw_c2w in zip(image_paths, raw_nerf_c2ws or [])
+        if raw_c2w is not None
+    }
     if camera_to_worlds is None:
         c2w_list = [None] * len(image_paths)
     else:
@@ -384,7 +401,13 @@ def generate_rgb2x_priors(
                     if (height, width) != (input_size, input_size):
                         img_tensor = TF.resize(img_tensor, [height, width])
                     if aov == "normal" and c2w is not None:
-                        img_tensor = _camera_normal_to_world(img_tensor, c2w)
+                        image_path = valid_items[batch_indices[i]][0]
+                        uses_raw_nerf_axes = image_path in raw_nerf_image_paths
+                        img_tensor = _camera_normal_to_world(
+                            img_tensor,
+                            c2w,
+                            c2w_uses_opengl_axes=uses_raw_nerf_axes,
+                        )
                     if aov == "albedo":
                         img_tensor = _srgb_to_linear(img_tensor)
                     alpha_orig = (

@@ -49,6 +49,7 @@ struct PipelineParameters {
     PackedTensorAccessor32<float, 5> rayPbrComponents; ///< output direct/indirect PBR components
 
     Environment environment;
+    NativeSGEnvironment sgEnvironment;
     unsigned int numLights;
     PackedTensorAccessor32<float, 2> lights; ///< packed lights [N, 9]: type + 8 params
     unsigned int numLightEntries;
@@ -124,6 +125,7 @@ struct PipelineBackwardParameters : PipelineParameters {
     PackedTensorAccessor32<float, 4> rayPbrGrad;         ///< accumulated PBR radiance gradient
     PackedTensorAccessor32<float, 4> rayLightGrad;       ///< environment light gradient without BRDF throughput
     PackedTensorAccessor32<float, 3> environmentGrad;    ///< optional environment map gradient
+    PackedTensorAccessor32<float, 2> sgEnvironmentGrad;  ///< native SG [K, 7] gradient
 
     ParticleDensity* particleDensityGrad; ///< output position, scale, quaternions, density gradient
     Material* particleMaterialGrad;       ///< output per-particle material gradient

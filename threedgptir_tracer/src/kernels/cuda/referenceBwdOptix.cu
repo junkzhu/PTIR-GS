@@ -56,6 +56,10 @@ extern "C" __global__ void __raygen__rg() {
 
 #ifdef ENABLE_MIS
     sampleNee(path, sampler);
+    // NEE is accumulated at the primary surface in the forward pass, so its
+    // material gradient must be recorded here as well.  Keeping this outside
+    // the BRDF-continuation branch also makes max_bounces=0 differentiable.
+    accumulateNeeGradBwd(path, ray, path.currentRayPayload.interaction, params);
 #endif
 
     for (unsigned int depth = 0; depth < params.maxBounces && path.active; ++depth) {
@@ -63,12 +67,28 @@ extern "C" __global__ void __raygen__rg() {
         PendingRayDirectionGradBwd(path, params);
 
         path.active &= (depth + 1u < path.maxBounces) && path.currentRayPayload.interaction.valid;
-        if (!path.active) { break; }
+        if (!path.active) {
+            // With zero BRDF continuations, primary material/AOV gradients
+            // (and NEE gradients when enabled) still have to reach Gaussians.
+            if (depth == 0u && path.currentRayPayload.interaction.valid) {
+                rayIntersectBwd<false>(
+                    path.currentRayPayload.ray,
+                    1.0f - path.currentRayPayload.transmittance,
+                    path.currentRayPayload.lastHitDistance,
+                    path.currentRayPayload.interaction.materialGrad,
+                    path.currentRayPayload.interaction.selectedParticleId,
+                    params);
+            }
+            break;
+        }
         path.numBounces = depth + 1u;
 
         sampleBrdfNextDirectionBwd(path, sampler, params);
         const float throughputMax = fmaxf(path.pathThroughput.x, fmaxf(path.pathThroughput.y, path.pathThroughput.z));
         if (throughputMax < 1e-4f) { break; }
+#ifdef ENABLE_RUSSIAN_ROULETTE
+        if (!applyRussianRoulette(path, sampler)) { break; }
+#endif
         rayIntersect<true>(path.currentRayPayload.ray, path.currentRayPayload, sampler);
     }
 }

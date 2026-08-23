@@ -63,6 +63,11 @@ extern "C" __global__ void __raygen__rg() {
         if (throughputMax < 1e-4f) {
             break;
         }
+#ifdef ENABLE_RUSSIAN_ROULETTE
+        if (!applyRussianRoulette(path, sampler)) {
+            break;
+        }
+#endif
         rayIntersect<true>(path.currentRayPayload.ray, path.currentRayPayload, sampler);
     }
 

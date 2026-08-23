@@ -99,6 +99,7 @@ struct PendingRayDirectionGrad {
         maxHitDistance = 0.f;
         dNextDirDRoughness = make_float3(0.f);
         numBounces = 0u;
+        selectedParticleId = Interaction::InvalidParticleId;
     }
 
     __device__ void set(
@@ -106,7 +107,8 @@ struct PendingRayDirectionGrad {
         const float pendingOpacity,
         const float pendingMaxHitDistance,
         const float3& pendingDNextDirDRoughness,
-        const unsigned int pendingNumBounces) {
+        const unsigned int pendingNumBounces,
+        const unsigned int pendingSelectedParticleId) {
         const float gradLength2 =
             pendingDNextDirDRoughness.x * pendingDNextDirDRoughness.x +
             pendingDNextDirDRoughness.y * pendingDNextDirDRoughness.y +
@@ -117,6 +119,7 @@ struct PendingRayDirectionGrad {
         maxHitDistance = pendingMaxHitDistance;
         dNextDirDRoughness = pendingDNextDirDRoughness;
         numBounces = pendingNumBounces;
+        selectedParticleId = pendingSelectedParticleId;
     }
 
     bool valid;
@@ -125,6 +128,7 @@ struct PendingRayDirectionGrad {
     float maxHitDistance;
     float3 dNextDirDRoughness;
     unsigned int numBounces;
+    unsigned int selectedParticleId;
 };
 
 struct pathPayload {

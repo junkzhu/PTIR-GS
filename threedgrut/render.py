@@ -56,6 +56,17 @@ from threedgrut.utils.render import apply_post_processing
 
 
 class Renderer:
+    @staticmethod
+    def _uses_native_sg(conf, model=None) -> bool:
+        environment_type = str(
+            OmegaConf.select(conf, "environment.type", default="2d")
+        ).lower()
+        module = None if model is None else getattr(model, "environment", None)
+        return (
+            environment_type == "spherical_gaussian"
+            and (module is None or hasattr(module, "native_parameters"))
+        )
+
     def __init__(
         self,
         model,
@@ -163,7 +174,11 @@ class Renderer:
         model.environment_parameterization = environment.environment_parameterization
         Renderer._set_model_environment(model, environment.get_environment_parameter())
         model.environment_alias_table = None
-        if conf.render.method == "3dgptir" and conf.render.get("enable_mis", False):
+        if (
+            conf.render.method == "3dgptir"
+            and conf.render.get("enable_mis", False)
+            and not Renderer._uses_native_sg(conf, model)
+        ):
             model.environment_alias_table = environment.build_alias_table()
 
     @staticmethod
@@ -224,8 +239,13 @@ class Renderer:
         batch.mesh_lights = mesh_light_pack.params
         batch.mesh_light_triangle_alias_table = mesh_light_pack.triangle_alias_table
         environment_type = OmegaConf.select(self.conf, "environment.type", default="2d")
+        environment_for_sampling = (
+            self.model.environment
+            if self._uses_native_sg(self.conf, self.model)
+            else self.model.get_environment()
+        )
         light_alias_table = build_light_alias_table(
-            environment=self.model.get_environment(),
+            environment=environment_for_sampling,
             environment_type=environment_type,
             lights=batch.lights,
             mesh_powers=mesh_light_pack.powers,
@@ -296,6 +316,27 @@ class Renderer:
         global_step = checkpoint["global_step"]
 
         conf = checkpoint["config"]
+        if OmegaConf.select(conf, "render.max_bounces", default=None) is None:
+            OmegaConf.update(
+                conf,
+                "render.max_bounces",
+                3,
+                force_add=True,
+            )
+        if OmegaConf.select(conf, "render.render_bounces", default=None) is None:
+            OmegaConf.update(
+                conf,
+                "render.render_bounces",
+                3,
+                force_add=True,
+            )
+        if OmegaConf.select(conf, "render.russian_roulette", default=None) is None:
+            OmegaConf.update(
+                conf,
+                "render.russian_roulette",
+                True,
+                force_add=True,
+            )
         if config_overrides:
             conf = OmegaConf.merge(conf, OmegaConf.from_dotlist(list(config_overrides)))
         # overrides

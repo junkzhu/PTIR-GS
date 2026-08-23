@@ -157,7 +157,7 @@ loss:
   normal_priors_end_iteration: 30000
   lambda_normal_priors_regularization: 0.01
 
-  use_edge_aware_smoothness: true
+  use_edge_aware_smoothness: false
   lambda_edge_aware_smoothness: 0.01
   edge_aware_smoothness_outputs:
     - pred_shadingnormal

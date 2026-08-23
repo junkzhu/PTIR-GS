@@ -27,7 +27,6 @@ static constexpr float FastBrdfEps      = 1e-6f;
 static constexpr float FastBrdfMinRough = 0.05f;
 static constexpr float FastBrdfPi2      = 6.28318530717958647692f;
 static constexpr float FastBrdfInvPi    = 0.31830988618379067154f;
-static constexpr float FastBrdfRoughnessGradEps = 1e-3f;
 
 #ifdef FAST_BRDF_GUARD_NAN
 static constexpr float FastBrdfMaxValue = 1e20f;
@@ -154,7 +153,7 @@ static __device__ __forceinline__ float3 sample_fast_brdf_ggx_half_vector(
     const float alpha  = rough * rough;
     const float alpha2 = alpha * alpha;
     const float xi     = fast_brdf_saturate(u1);
-    const float denom  = fmaxf(1.0f + (alpha2 - 1.0f) * xi, FastBrdfEps);
+    const float denom  = fmaxf((1.0f - xi) + alpha2 * xi, FastBrdfEps);
 
     const float cosTheta = sqrtf(fmaxf(0.0f, (1.0f - xi) / denom));
     const float sinTheta = sqrtf(fmaxf(0.0f, 1.0f - cosTheta * cosTheta));
@@ -180,42 +179,6 @@ static __device__ __forceinline__ float3 sample_fast_brdf_ggx_half_vector(
     float sampledNdotH = 0.0f;
     float halfVectorPdf = 0.0f;
     return sample_fast_brdf_ggx_half_vector(normal, rough, u1, u2, sampledNdotH, halfVectorPdf);
-}
-
-static __device__ __forceinline__ float eval_fast_brdf_mixed_pdf_roughness_grad(
-    const float3& wo,
-    const float3& normal,
-    const float roughness,
-    const float3& lightDirection) {
-    const float3 L = fast_brdf_safe_normalize(lightDirection, normal);
-    const float NdotV = fast_brdf_positive_dot(normal, wo);
-    const float NdotL = fast_brdf_positive_dot(normal, L);
-    if (NdotV <= 0.0f || NdotL <= 0.0f) {
-        return 0.0f;
-    }
-
-    const float dRough_dInput = (roughness > FastBrdfMinRough && roughness < 1.0f) ? 1.0f : 0.0f;
-    if (dRough_dInput == 0.0f) {
-        return 0.0f;
-    }
-
-    const float rough = fast_brdf_clamp_roughness(roughness);
-    const float3 H    = fast_brdf_safe_normalize(wo + L, normal);
-    const float NdotH = fast_brdf_positive_dot(normal, H);
-    const float VdotH = fast_brdf_positive_dot(wo, H);
-    if (VdotH <= 0.0f) {
-        return 0.0f;
-    }
-
-    const float alpha  = rough * rough;
-    const float alpha2 = alpha * alpha;
-    const float dDenom = fmaxf(NdotH * NdotH * (alpha2 - 1.0f) + 1.0f, FastBrdfEps);
-    const float dD_dAlpha2 = FastBrdfInvPi * (
-        1.0f / fmaxf(dDenom * dDenom, FastBrdfEps) -
-        (2.0f * alpha2 * NdotH * NdotH) / fmaxf(dDenom * dDenom * dDenom, FastBrdfEps));
-    const float dAlpha2_dRough = 4.0f * rough * rough * rough;
-    const float dD_dRoughness  = dD_dAlpha2 * dAlpha2_dRough * dRough_dInput;
-    return 0.5f * dD_dRoughness * NdotH / fmaxf(4.0f * VdotH, FastBrdfEps);
 }
 
 static __device__ __forceinline__ float3 eval_fast_brdf_light_sample(
@@ -351,9 +314,8 @@ static __device__ __forceinline__ FastBrdfValueGrad sample_fast_brdf_throughput_
     float& scatterPdf) {
     const float rough = fast_brdf_clamp_roughness(roughness);
 
-    float3 dNextDir_dRoughness = make_float3(0.0f);
-    float3 L                   = normal;
-    scatterPdf                 = 0.0f;
+    float3 L   = normal;
+    scatterPdf = 0.0f;
 
     if (rand.z < 0.5f) {
         float directionPdf = 0.0f;
@@ -362,20 +324,6 @@ static __device__ __forceinline__ FastBrdfValueGrad sample_fast_brdf_throughput_
         const float3 H = sample_fast_brdf_ggx_half_vector(normal, rough, rand.x, rand.y);
         const float rawVdotH = dot(wo, H);
         L                   = 2.0f * rawVdotH * H - wo;
-        const bool validNextDirection = dot(normal, L) > 0.0f;
-
-        const float drough_dinput = (roughness > FastBrdfMinRough && roughness < 1.0f) ? 1.0f : 0.0f;
-        if ((drough_dinput > 0.0f) && validNextDirection) {
-            const float roughShifted = fast_brdf_clamp_roughness(roughness + FastBrdfRoughnessGradEps);
-            const float roughStep    = roughShifted - rough;
-            if (roughStep > FastBrdfEps) {
-                const float3 shiftedH = sample_fast_brdf_ggx_half_vector(normal, roughShifted, rand.x, rand.y);
-                const float3 shiftedL = 2.0f * dot(wo, shiftedH) * shiftedH - wo;
-                if (dot(normal, shiftedL) > 0.0f) {
-                    dNextDir_dRoughness = (shiftedL - L) / roughStep;
-                }
-            }
-        }
     }
 
     FastBrdfValueGrad result;
@@ -383,7 +331,7 @@ static __device__ __forceinline__ FastBrdfValueGrad sample_fast_brdf_throughput_
     result.dBrdf_dAlbedo       = make_float3(0.0f);
     result.dBrdf_dRoughness    = make_float3(0.0f);
     result.dBrdf_dMetallic     = make_float3(0.0f);
-    result.dNextDir_dRoughness = dNextDir_dRoughness;
+    result.dNextDir_dRoughness = make_float3(0.0f);
 
     nextRayDirection = L;
     if (dot(normal, nextRayDirection) <= 0.0f) {
@@ -409,15 +357,12 @@ static __device__ __forceinline__ FastBrdfValueGrad sample_fast_brdf_throughput_
     const float invPdf = 1.0f / fmaxf(scatterPdf, FastBrdfEps);
     const float3 value = brdfTimesCos.value * invPdf;
     const float3 valueMask = fast_brdf_nonnegative_grad_mask(value);
-    const float dPdf_dRoughness = eval_fast_brdf_mixed_pdf_roughness_grad(
-        wo,
-        normal,
-        roughness,
-        nextRayDirection);
-
     result.value               = fast_brdf_clamp_nonnegative(value);
     result.dBrdf_dAlbedo       = brdfTimesCos.dBrdf_dAlbedo * invPdf * valueMask;
-    result.dBrdf_dRoughness    = (brdfTimesCos.dBrdf_dRoughness * invPdf - brdfTimesCos.value * (dPdf_dRoughness * invPdf * invPdf)) * valueMask;
+    // Treat the sampled direction and proposal PDF as detached. Differentiating
+    // f / p through p without the matching score-function term is biased; the
+    // unbiased detached-proposal estimator is (df / droughness) / p.
+    result.dBrdf_dRoughness    = brdfTimesCos.dBrdf_dRoughness * invPdf * valueMask;
 #ifdef ENABLE_METALLIC
     result.dBrdf_dMetallic     = brdfTimesCos.dBrdf_dMetallic * invPdf * valueMask;
 #endif
@@ -474,7 +419,12 @@ static __device__ __forceinline__ float3 eval_fast_brdf_light_sample(
 
     const float alpha  = rough * rough;
     const float alpha2 = alpha * alpha;
-    const float dDenom = fmaxf(NdotH * NdotH * (alpha2 - 1.0f) + 1.0f, FastBrdfEps);
+    // H is in world space, so H.x^2 + H.y^2 would only be sin^2(theta_h)
+    // when the shading normal happened to be (0, 0, 1).  The cross-product
+    // form is coordinate independent and remains stable near NdotH == 1.
+    const float3 normalCrossH = cross(normal, H);
+    const float sinThetaH2 = dot(normalCrossH, normalCrossH);
+    const float dDenom = fmaxf(sinThetaH2 + alpha2 * NdotH * NdotH, FastBrdfEps);
     const float D      = alpha2 * FastBrdfInvPi / fmaxf(dDenom * dDenom, FastBrdfEps);
 
     const float k  = 0.5f * rough * rough;
@@ -553,7 +503,9 @@ static __device__ __forceinline__ FastBrdfValueGrad eval_fast_brdf_light_sample_
 
     const float alpha  = rough * rough;
     const float alpha2 = alpha * alpha;
-    const float dDenom = fmaxf(NdotH * NdotH * (alpha2 - 1.0f) + 1.0f, FastBrdfEps);
+    const float3 normalCrossH = cross(normal, H);
+    const float sinThetaH2 = dot(normalCrossH, normalCrossH);
+    const float dDenom = fmaxf(sinThetaH2 + alpha2 * NdotH * NdotH, FastBrdfEps);
     const float D = alpha2 * FastBrdfInvPi / fmaxf(dDenom * dDenom, FastBrdfEps);
 
     const float k = 0.5f * rough * rough;
@@ -585,7 +537,13 @@ static __device__ __forceinline__ FastBrdfValueGrad eval_fast_brdf_light_sample_
     const float3 dSpecular_dAlbedo = make_float3(dF_dAlbedo * specularScale);
     result.dBrdf_dAlbedo = (dDiffuse_dAlbedo + dSpecular_dAlbedo) * valueMask;
 
-    const float dD_dAlpha2 = FastBrdfInvPi * (1.0f / fmaxf(dDenom * dDenom, FastBrdfEps) - (2.0f * alpha2 * NdotH * NdotH) / fmaxf(dDenom * dDenom * dDenom, FastBrdfEps));
+    // Match the piecewise clamp used by the forward D evaluation above.
+    // When dDenom^2 is clamped, only the numerator alpha2 contributes.
+    const float dDenom2 = dDenom * dDenom;
+    const float dD_dAlpha2 = (dDenom2 > FastBrdfEps)
+        ? FastBrdfInvPi * (sinThetaH2 - alpha2 * NdotH * NdotH) /
+              (dDenom2 * dDenom)
+        : FastBrdfInvPi / FastBrdfEps;
     const float dAlpha2_dRough = 4.0f * rough * rough * rough;
     const float dD_dRough = dD_dAlpha2 * dAlpha2_dRough;
     const float dGv_dk = -NdotV * (1.0f - NdotV) / (Dv * Dv);

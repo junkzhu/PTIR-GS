@@ -178,6 +178,139 @@ static __device__ __forceinline__ float3 inverseRotateEnvironmentDirection(const
         xRotatedDir.z);
 }
 
+static constexpr int NativeSGLobeParameterCount = 7;
+static constexpr int NativeSGSamplingParameterCount = 2;
+static constexpr float NativeSGUniformThreshold = 1.0e-6f;
+
+static __device__ __forceinline__ bool hasNativeSGEnvironment() {
+    return params.sgEnvironment.lobes != nullptr
+        && params.sgEnvironment.sampling != nullptr
+        && params.sgEnvironment.numLobes > 0;
+}
+
+static __device__ __forceinline__ const float* nativeSGLobe(const int index) {
+    return params.sgEnvironment.lobes + index * NativeSGLobeParameterCount;
+}
+
+static __device__ __forceinline__ const float* nativeSGSampling(const int index) {
+    return params.sgEnvironment.sampling + index * NativeSGSamplingParameterCount;
+}
+
+static __device__ __forceinline__ float3 nativeSGAxis(const float* lobe) {
+    const float3 rawAxis = make_float3(lobe[0], lobe[1], lobe[2]);
+    const float lengthSquared = dot(rawAxis, rawAxis);
+    if (!isfinite(lengthSquared) || lengthSquared <= 1.0e-16f) {
+        return make_float3(0.0f, 1.0f, 0.0f);
+    }
+    return rawAxis * rsqrtf(lengthSquared);
+}
+
+static __device__ __forceinline__ float nativeSGSharpness(const float* lobe) {
+    return isfinite(lobe[3]) ? fminf(fmaxf(lobe[3], 1.0e-8f), 1.0e4f) : 1.0e-8f;
+}
+
+static __device__ __forceinline__ float nativeSGNormalization(const float sharpness) {
+    return 2.0f * CUDART_PI_F * (-expm1f(-2.0f * sharpness)) / sharpness;
+}
+
+static __device__ __forceinline__ float nativeSGBasis(
+    const float3& envDirection,
+    const float3& axis,
+    const float sharpness) {
+    const float cosine = fminf(1.0f, fmaxf(-1.0f, dot(axis, envDirection)));
+    return expf(sharpness * (cosine - 1.0f));
+}
+
+static __device__ __forceinline__ float3 evalNativeSGEnvironmentRotated(
+    const float3& envDirection) {
+    float3 radiance = make_float3(0.0f);
+    for (int k = 0; k < params.sgEnvironment.numLobes; ++k) {
+        const float* lobe = nativeSGLobe(k);
+        const float basis = nativeSGBasis(
+            envDirection, nativeSGAxis(lobe), nativeSGSharpness(lobe));
+        const float3 amplitude = make_float3(lobe[4], lobe[5], lobe[6]);
+        radiance += basis * amplitude;
+    }
+    return make_float3(
+        isfinite(radiance.x) ? radiance.x : 0.0f,
+        isfinite(radiance.y) ? radiance.y : 0.0f,
+        isfinite(radiance.z) ? radiance.z : 0.0f);
+}
+
+static __device__ __forceinline__ float nativeSGEnvironmentPdf(const float3& rayDirection) {
+    if (!hasNativeSGEnvironment()) {
+        return 0.0f;
+    }
+
+    const float3 envDirection = rotateEnvironmentDirection(rayDirection);
+    float pdf = 0.0f;
+    for (int k = 0; k < params.sgEnvironment.numLobes; ++k) {
+        const float* lobe = nativeSGLobe(k);
+        const float* sampling = nativeSGSampling(k);
+        const float sharpness = nativeSGSharpness(lobe);
+        const float normalization = isfinite(sampling[0]) && sampling[0] > 0.0f
+            ? sampling[0]
+            : nativeSGNormalization(sharpness);
+        const float alpha = isfinite(sampling[1]) && sampling[1] > 0.0f
+            ? sampling[1]
+            : 0.0f;
+        pdf += alpha * nativeSGBasis(envDirection, nativeSGAxis(lobe), sharpness)
+            / fmaxf(normalization, 1.0e-20f);
+    }
+    return isfinite(pdf) && pdf > 0.0f ? pdf : 0.0f;
+}
+
+static __device__ __forceinline__ float3 sampleNativeSGEnvironmentDirection(
+    Sampler& sampler,
+    float& pdf) {
+    const float selectSample = sampler.next_1d();
+    float cumulative = 0.0f;
+    int selected = params.sgEnvironment.numLobes - 1;
+    for (int k = 0; k < params.sgEnvironment.numLobes; ++k) {
+        cumulative += fmaxf(nativeSGSampling(k)[1], 0.0f);
+        if (selectSample < cumulative) {
+            selected = k;
+            break;
+        }
+    }
+
+    const float* lobe = nativeSGLobe(selected);
+    const float3 axis = nativeSGAxis(lobe);
+    const float sharpness = nativeSGSharpness(lobe);
+    const float u1 = sampler.next_1d();
+    const float u2 = sampler.next_1d();
+
+    float cosTheta;
+    if (sharpness < NativeSGUniformThreshold) {
+        cosTheta = -1.0f + 2.0f * u1;
+    } else {
+        const float oneMinusExpNegativeTwoLambda = -expm1f(-2.0f * sharpness);
+        const float oneMinusInverseCdf = fminf(
+            (1.0f - u1) * oneMinusExpNegativeTwoLambda,
+            1.0f - 1.19209290e-7f);
+        cosTheta = 1.0f
+            + log1pf(-oneMinusInverseCdf) / sharpness;
+        cosTheta = fminf(1.0f, fmaxf(-1.0f, cosTheta));
+    }
+
+    const float sinTheta = sqrtf(fmaxf(0.0f, 1.0f - cosTheta * cosTheta));
+    const float phi = 2.0f * CUDART_PI_F * u2;
+    float sinPhi;
+    float cosPhi;
+    sincosf(phi, &sinPhi, &cosPhi);
+
+    float3 tangent;
+    float3 bitangent;
+    branchlessONB(axis, tangent, bitangent);
+    const float3 envDirection = safe_normalize(
+        tangent * (sinTheta * cosPhi)
+        + bitangent * (sinTheta * sinPhi)
+        + axis * cosTheta);
+    const float3 rayDirection = inverseRotateEnvironmentDirection(envDirection);
+    pdf = nativeSGEnvironmentPdf(rayDirection);
+    return rayDirection;
+}
+
 static __device__ __forceinline__ float3 environmentEquirectUVToDirection(float u, float v) {
     u = u - floorf(u);
     v = fminf(fmaxf(v, 0.0f), 1.0f);
@@ -444,7 +577,43 @@ static __device__ __forceinline__ float3 getBackgroundRayDirectionGradFast(
     return tangent * tangentGrad + bitangent * bitangentGrad;
 }
 
+template <typename PipelineParams>
+static __device__ __forceinline__ float3 evalNativeSGEnvironmentRotatedBwd(
+    const float3& envDirection,
+    const float3& colorGrad,
+    PipelineParams& pipelineParams,
+    float3* envDirectionGrad = nullptr) {
+    float3 radiance = make_float3(0.0f);
+    float3 directionGrad = make_float3(0.0f);
+    for (int k = 0; k < params.sgEnvironment.numLobes; ++k) {
+        const float* lobe = nativeSGLobe(k);
+        const float3 axis = nativeSGAxis(lobe);
+        const float sharpness = nativeSGSharpness(lobe);
+        const float cosine = fminf(1.0f, fmaxf(-1.0f, dot(axis, envDirection)));
+        const float basis = expf(sharpness * (cosine - 1.0f));
+        const float3 amplitude = make_float3(lobe[4], lobe[5], lobe[6]);
+        const float exponentGrad = dot(colorGrad, amplitude) * basis;
+
+        radiance += basis * amplitude;
+        atomicAdd(&pipelineParams.sgEnvironmentGrad[k][0], exponentGrad * sharpness * envDirection.x);
+        atomicAdd(&pipelineParams.sgEnvironmentGrad[k][1], exponentGrad * sharpness * envDirection.y);
+        atomicAdd(&pipelineParams.sgEnvironmentGrad[k][2], exponentGrad * sharpness * envDirection.z);
+        atomicAdd(&pipelineParams.sgEnvironmentGrad[k][3], exponentGrad * (cosine - 1.0f));
+        atomicAdd(&pipelineParams.sgEnvironmentGrad[k][4], colorGrad.x * basis);
+        atomicAdd(&pipelineParams.sgEnvironmentGrad[k][5], colorGrad.y * basis);
+        atomicAdd(&pipelineParams.sgEnvironmentGrad[k][6], colorGrad.z * basis);
+        directionGrad += exponentGrad * sharpness * axis;
+    }
+    if (envDirectionGrad != nullptr) {
+        *envDirectionGrad += directionGrad;
+    }
+    return radiance;
+}
+
 static __device__ __forceinline__ float3 getBackgroundColor(const float3 rayDir) {
+    if (hasNativeSGEnvironment()) {
+        return evalNativeSGEnvironmentRotated(rotateEnvironmentDirection(rayDir));
+    }
     if (params.environment.data == nullptr || params.environment.width <= 0 || params.environment.height <= 0) {
         return make_float3(0.0f);
     }
@@ -459,6 +628,16 @@ static __device__ __forceinline__ float3 getBackgroundColorBwd(
     const float3& colorGrad,
     PipelineParams& pipelineParams,
     float3* rayDirGrad = nullptr) {
+    if (hasNativeSGEnvironment()) {
+        const float3 envDirection = rotateEnvironmentDirection(rayDir);
+        float3 envDirectionGrad = make_float3(0.0f);
+        const float3 background = evalNativeSGEnvironmentRotatedBwd(
+            envDirection, colorGrad, pipelineParams, &envDirectionGrad);
+        if (rayDirGrad != nullptr) {
+            *rayDirGrad += inverseRotateEnvironmentDirection(envDirectionGrad);
+        }
+        return background;
+    }
     if (params.environment.data == nullptr || params.environment.width <= 0 || params.environment.height <= 0) {
         return make_float3(0.0f);
     }
@@ -623,7 +802,8 @@ static __device__ __forceinline__ VisibleLightHit getVisibleLightHit(const Ray& 
     }
 #endif
 
-    if (!nearest.valid && params.environment.data != nullptr && params.environment.width > 0 && params.environment.height > 0) {
+    if (!nearest.valid && (hasNativeSGEnvironment()
+        || (params.environment.data != nullptr && params.environment.width > 0 && params.environment.height > 0))) {
         nearest.valid = true;
         nearest.isEnvironment = true;
         nearest.dist = 1e20f;
@@ -635,13 +815,15 @@ static __device__ __forceinline__ VisibleLightHit getVisibleLightHit(const Ray& 
 
 static __device__ __forceinline__ void accumulateLightContribution(pathPayload& path) {
     path.currentRayPayload.contribution = make_float3(0.0f);
+    const bool primarySurface = path.numBounces == 0u;
     const bool firstSecondaryBounce = path.numBounces == 1u;
 
 #ifdef ENABLE_MIS
     const float brdfSideMis = firstSecondaryBounce
         ? misWeight(path.currentRayPayload.scatterPdf, path.currentRayPayload.lightPdf)
         : 1.0f;
-    const float lightSideMis = firstSecondaryBounce
+    const bool hasBrdfContinuation = path.maxBounces > 1u;
+    const float lightSideMis = primarySurface && hasBrdfContinuation
         ? misWeight(path.emitterRayPayload.lightPdf, path.emitterRayPayload.scatterPdf)
         : 1.0f;
     const float3 neeContribution = path.emitterRayPayload.contribution * lightSideMis;
@@ -649,7 +831,7 @@ static __device__ __forceinline__ void accumulateLightContribution(pathPayload& 
 
     if (params.renderOpts == 1) {
 #ifdef ENABLE_MIS
-        if (firstSecondaryBounce) {
+        if (primarySurface) {
             path.accumulatedLighting += neeContribution;
         }
 #endif
@@ -683,7 +865,7 @@ static __device__ __forceinline__ void accumulateLightContribution(pathPayload& 
     }
 
 #ifdef ENABLE_MIS
-    if (firstSecondaryBounce) {
+    if (primarySurface) {
         path.accumulatedLighting += neeContribution;
         path.accumulatedDirectLighting += neeContribution;
     }
@@ -719,20 +901,22 @@ static __device__ __forceinline__ void accumulateLightContributionBwd(
     pathPayload& path,
     PipelineParams& pipelineParams) {
     path.currentRayPayload.contribution = make_float3(0.0f);
+    const bool primarySurface = path.numBounces == 0u;
     const bool firstSecondaryBounce = path.numBounces == 1u;
 
 #ifdef ENABLE_MIS
     const float brdfSideMis = firstSecondaryBounce
         ? misWeight(path.currentRayPayload.scatterPdf, path.currentRayPayload.lightPdf)
         : 1.0f;
-    const float lightSideMis = firstSecondaryBounce
+    const bool hasBrdfContinuation = path.maxBounces > 1u;
+    const float lightSideMis = primarySurface && hasBrdfContinuation
         ? misWeight(path.emitterRayPayload.lightPdf, path.emitterRayPayload.scatterPdf)
         : 1.0f;
 #endif
 
     if (params.renderOpts == 1) {
 #ifdef ENABLE_MIS
-        if (firstSecondaryBounce) {
+        if (primarySurface) {
             const float3 neeContribution = path.emitterRayPayload.contribution * lightSideMis;
             path.accumulatedLighting -= neeContribution;
         }
@@ -773,7 +957,7 @@ static __device__ __forceinline__ void accumulateLightContributionBwd(
     }
 
 #ifdef ENABLE_MIS
-    if (firstSecondaryBounce) {
+    if (primarySurface) {
         const float3 neeContribution = path.emitterRayPayload.contribution * lightSideMis;
         path.accumulatedLighting -= neeContribution;
     }

@@ -27,6 +27,38 @@
 static constexpr float kSelfOcclusionRayOriginOffset = 2e-2f;
 static constexpr float kMaxSelfOcclusionOffset = 1e-1f - kSelfOcclusionRayOriginOffset;
 static constexpr float kSelfOcclusionNormalDotThreshold = 0.1f;
+static constexpr float kHardGeometryOpacityThreshold = 0.5f;
+
+#ifdef ENABLE_RUSSIAN_ROULETTE
+// Preserve the primary and first two secondary segments. Roulette starts at
+// the third bounce while max_bounces remains the hard path-length limit.
+static constexpr unsigned int kRussianRouletteStartBounce = 3u;
+static constexpr float kRussianRouletteMinSurvivalProbability = 0.05f;
+static constexpr float kRussianRouletteMaxSurvivalProbability = 0.95f;
+
+static __device__ __forceinline__ bool applyRussianRoulette(
+    pathPayload& path,
+    Sampler& sampler) {
+    if (path.numBounces < kRussianRouletteStartBounce) {
+        return true;
+    }
+
+    const float throughputMax = fmaxf(
+        path.pathThroughput.x,
+        fmaxf(path.pathThroughput.y, path.pathThroughput.z));
+    const float survivalProbability = fminf(
+        kRussianRouletteMaxSurvivalProbability,
+        fmaxf(kRussianRouletteMinSurvivalProbability, throughputMax));
+    if (sampler.next_1d() >= survivalProbability) {
+        path.active = 0u;
+        return false;
+    }
+
+    // Compensate surviving paths so roulette changes variance, not expectation.
+    path.pathThroughput /= survivalProbability;
+    return true;
+}
+#endif
 
 struct RayHit {
     unsigned int particleId;
@@ -234,6 +266,23 @@ static __device__ __inline__ void rayIntersect(
     float integratedDepth = 0.f;
     Material integratedMaterial;
     float3 integratedShadingnormal = make_float3(0.f);
+    Material* integratedMaterialOut = &integratedMaterial;
+    float3* integratedShadingnormalOut = nullptr;
+    float3* integratedNormalOut = nullptr;
+#ifdef ENABLE_NORMALS
+    integratedShadingnormalOut = &integratedShadingnormal;
+    integratedNormalOut = &payload.normal;
+#endif
+#ifdef ENABLE_DISCRETE_MODEL
+    integratedMaterialOut = nullptr;
+    integratedShadingnormalOut = nullptr;
+    integratedNormalOut = nullptr;
+
+    // Keep surface selection independent from the BRDF/MIS random stream.
+    Sampler discreteSampler = sampler.fork(1ull);
+    unsigned int selectedParticleId = Interaction::InvalidParticleId;
+    ParticleHit selectedHit;
+#endif
 
     while ((payload.lastHitDistance <= minMaxT.y) && (payload.transmittance > params.minTransmittance)) {
         trace(hitPayload, payload.ray, payload.lastHitDistance + epsT, minMaxT.y + epsT);
@@ -251,6 +300,12 @@ static __device__ __inline__ void rayIntersect(
                     continue;
                 }
 
+#ifdef ENABLE_DISCRETE_MODEL
+                ParticleHit particleHit;
+                ParticleHit* particleHitOut = &particleHit;
+#else
+                ParticleHit* particleHitOut = nullptr;
+#endif
                 const bool acceptedHit = processHit<PipelineParameters::ParticleKernelDegree, PipelineParameters::SurfelPrimitive>(
                     payload.ray.origin,
                     payload.ray.direction,
@@ -266,16 +321,18 @@ static __device__ __inline__ void rayIntersect(
                     &payload.radiance,
                     &integratedDepth,
                     &payload.hitDistanceSecondMoment,
-                    &integratedMaterial,
-#ifdef ENABLE_NORMALS
-                    &integratedShadingnormal,
-                    &payload.normal
-#else
-                    nullptr,
-                    nullptr
-#endif
-                );
+                    integratedMaterialOut,
+                    integratedShadingnormalOut,
+                    integratedNormalOut,
+                    particleHitOut);
                 if (acceptedHit) {
+#ifdef ENABLE_DISCRETE_MODEL
+                    const float accumulatedOpacity = 1.0f - payload.transmittance;
+                    if (discreteSampler.next_1d() * accumulatedOpacity < particleHit.opacityWeight) {
+                        selectedParticleId = rayHit.particleId;
+                        selectedHit = particleHit;
+                    }
+#endif
                     payload.hit = 1;
                     const float rayOpacity = 1.0f - payload.transmittance;
                     payload.depthDistortion = fmaxf(rayOpacity * payload.hitDistanceSecondMoment - integratedDepth * integratedDepth, 0.0f);
@@ -293,10 +350,30 @@ static __device__ __inline__ void rayIntersect(
         }
     }
 
-    const float rayOpacity = 1.0f - payload.transmittance;
     payload.hitDistance = integratedDepth;
     payload.valid = false;
-    if (payload.hit && rayOpacity > 0.5f) {
+#ifdef ENABLE_DISCRETE_MODEL
+    const bool hasInteraction = selectedParticleId != Interaction::InvalidParticleId;
+#else
+    const float rayOpacity = 1.0f - payload.transmittance;
+    const bool hasInteraction = payload.hit && rayOpacity > kHardGeometryOpacityThreshold;
+#endif
+    if (hasInteraction) {
+#ifdef ENABLE_DISCRETE_MODEL
+        // Keep the integrated hit-distance accumulator: the Python wrapper
+        // normalizes it by aggregate ray opacity after the launch. The selected
+        // hit distance is used only for the PBR interaction position.
+        payload.normal = selectedHit.normal;
+        payload.interaction = Interaction(
+            make_float3(
+                payload.ray.origin.x + payload.ray.direction.x * selectedHit.hitT,
+                payload.ray.origin.y + payload.ray.direction.y * selectedHit.hitT,
+                payload.ray.origin.z + payload.ray.direction.z * selectedHit.hitT),
+            selectedHit.shadingnormal,
+            selectedHit.material,
+            true);
+        payload.interaction.selectedParticleId = selectedParticleId;
+#else
         payload.interaction = Interaction(
             payload.ray.origin,
             payload.ray.direction,
@@ -304,6 +381,7 @@ static __device__ __inline__ void rayIntersect(
             integratedShadingnormal,
             integratedMaterial,
             rayOpacity);
+#endif
     } else {
         const float rand_u = sampler.next_1d();
         payload.valid = (rand_u < payload.transmittance);
@@ -316,7 +394,22 @@ static __device__ __inline__ void rayIntersectBwd(
     const float rayOpacity,
     const float rayMaxHitDistance,
     const MaterialGrad& materialGrad,
+    const unsigned int selectedParticleId,
     const PipelineParams& pipelineParams) {
+#ifdef ENABLE_DISCRETE_MODEL
+    if (selectedParticleId == Interaction::InvalidParticleId) {
+        return;
+    }
+
+    Material& particleMaterialGrad = pipelineParams.particleMaterialGrad[selectedParticleId];
+    atomicAdd(&particleMaterialGrad.albedo.x, materialGrad.dAlbedo.x);
+    atomicAdd(&particleMaterialGrad.albedo.y, materialGrad.dAlbedo.y);
+    atomicAdd(&particleMaterialGrad.albedo.z, materialGrad.dAlbedo.z);
+    atomicAdd(&particleMaterialGrad.roughness, materialGrad.dRoughness);
+#ifdef ENABLE_METALLIC
+    atomicAdd(&particleMaterialGrad.metallic, materialGrad.dMetallic);
+#endif
+#else
     const float invRayOpacity = 1.0f / fmaxf(rayOpacity, 1e-12f);
     const Material rayMaterialGrad(
         materialGrad.dAlbedo * invRayOpacity,
@@ -326,7 +419,10 @@ static __device__ __inline__ void rayIntersectBwd(
     constexpr float epsT = 1e-9;
     const float2 minMaxT = intersectAABB(pipelineParams.aabb, ray);
     float startT         = fmaxf(0.0f, minMaxT.x - epsT);
-    const float endT     = fminf(rayMaxHitDistance, minMaxT.y) + epsT;
+    // Replay the same full AABB traversal as rayIntersect().  Clipping to the
+    // last reported hit is vulnerable to the OptiX tmax boundary excluding
+    // that final hit, which silently drops its material gradient.
+    const float endT     = minMaxT.y + epsT;
 
     float rayTransmittance = 1.f;
     RayPayload hitPayload;
@@ -387,6 +483,7 @@ static __device__ __inline__ void rayIntersectBwd(
             }
         }
     }
+#endif
 }
 
 template <typename PipelineParams>
@@ -403,6 +500,7 @@ static __device__ __inline__ void PendingRayDirectionGradBwd(
     const float pendingOpacity = pending.opacity;
     const float pendingMaxHitDistance = pending.maxHitDistance;
     const unsigned int pendingNumBounces = pending.numBounces;
+    const unsigned int pendingSelectedParticleId = pending.selectedParticleId;
     path.pendingRayDirectionGrad.clear();
     if (dRoughness == 0.0f) {
         return;
@@ -416,6 +514,7 @@ static __device__ __inline__ void PendingRayDirectionGradBwd(
             pendingOpacity,
             pendingMaxHitDistance,
             materialGrad,
+            pendingSelectedParticleId,
             pipelineParams);
     } else {
         rayIntersectBwd<false>(
@@ -423,6 +522,7 @@ static __device__ __inline__ void PendingRayDirectionGradBwd(
             pendingOpacity,
             pendingMaxHitDistance,
             materialGrad,
+            pendingSelectedParticleId,
             pipelineParams);
     }
 }
@@ -510,7 +610,7 @@ static __device__ __inline__ void accumulateNeeGradBwd(
     const Ray& currentRay,
     const Interaction& currentInteraction,
     PipelineParams& pipelineParams) {
-    if (path.numBounces != 1u) {
+    if (path.numBounces != 0u) {
         return;
     }
     if (path.emitterRayPayload.lightPdf <= 0.0f) {
@@ -525,20 +625,23 @@ static __device__ __inline__ void accumulateNeeGradBwd(
         lightDirection,
         scatterPdf);
 
-    const float lightSideMis = misWeight(
-        path.emitterRayPayload.lightPdf,
-        path.emitterRayPayload.scatterPdf);
+    const float lightSideMis = path.maxBounces > 1u
+        ? misWeight(
+              path.emitterRayPayload.lightPdf,
+              path.emitterRayPayload.scatterPdf)
+        : 1.0f;
     const float neeScale = lightSideMis / fmaxf(path.emitterRayPayload.lightPdf, 1e-6f);
 
-    // Keep NEE envmap gradients disabled by default: differentiating the sampled
-    // environment texel here has high variance.
-    //const float3 environmentGrad = path.accumulatedLightingGrad * path.pathThroughput * brdfTimesCos.value * neeScale;
-    //const float3 background = getBackgroundColorBwd(lightDirection, environmentGrad, pipelineParams);
-    const float3 background = getBackgroundColor(lightDirection);
-    const float3 dLoss_dBrdf = path.accumulatedLightingGrad * path.pathThroughput * background * neeScale;
+    // Keep NEE gradients from updating the environment: although the estimator
+    // is valid, it worsens the lighting-material ambiguity in prior-free inverse
+    // rendering and consistently degrades the recovered material metrics.
+    // const float3 environmentGrad = path.accumulatedLightingGrad * path.pathThroughput * brdfTimesCos.value * neeScale;
+    // getBackgroundColorBwd(lightDirection, environmentGrad, pipelineParams);
+    const float3 sampledLight = path.emitterRayPayload.light;
+    const float3 dLoss_dBrdf = path.accumulatedLightingGrad * path.pathThroughput * sampledLight * neeScale;
 
     path.currentRayPayload.interaction.materialGrad.dAlbedo += dLoss_dBrdf * brdfTimesCos.dBrdf_dAlbedo;
-    
+
     // NEE samples bright environment directions directly; enabling this roughness gradient can easily overfit specular highlights.
     //path.currentRayPayload.interaction.materialGrad.dRoughness += dot(dLoss_dBrdf, brdfTimesCos.dBrdf_dRoughness);
 // #ifdef ENABLE_METALLIC
@@ -565,48 +668,30 @@ static __device__ __inline__ void sampleBrdfNextDirectionBwd(
         nextRayDirection,
         scatterPdf);
     const float3 nextPathThroughput = path.pathThroughput * brdfThroughput.value;
-    if (nextPathThroughput.x == 0.0f && nextPathThroughput.y == 0.0f && nextPathThroughput.z == 0.0f) {
-        path.pathThroughput = make_float3(0.0f);
-        path.active = 0u;
-        return;
-    }
+    const bool validNextPath =
+        nextPathThroughput.x != 0.0f ||
+        nextPathThroughput.y != 0.0f ||
+        nextPathThroughput.z != 0.0f;
 
 #ifdef ENABLE_MIS
-    const float lightPdf = lightSamplerPdf(currentInteraction.position, nextRayDirection);
-    const float nextThroughputMax = fmaxf(nextPathThroughput.x, fmaxf(nextPathThroughput.y, nextPathThroughput.z));
-    const bool firstBounceNeeActive = path.numBounces == 1u && nextThroughputMax >= 1e-4f;
-    if (firstBounceNeeActive) {
-        accumulateNeeGradBwd(path, currentRay, currentInteraction, pipelineParams);
-    }
+    const float lightPdf = validNextPath
+        ? lightSamplerPdf(currentInteraction.position, nextRayDirection)
+        : 0.0f;
 #endif
 
-    float3 brdfDependentLighting = path.accumulatedLighting;
-#ifdef ENABLE_MIS
-    if (firstBounceNeeActive) {
-        const float lightSideMis = misWeight(
-            path.emitterRayPayload.lightPdf,
-            path.emitterRayPayload.scatterPdf);
-        brdfDependentLighting -= path.emitterRayPayload.contribution * lightSideMis;
-    }
-#endif
-
-    const float3 dLoss_dBrdfNumerator = path.accumulatedLightingGrad * brdfDependentLighting;
-    const float3 dLoss_dBrdf = make_float3(
-        brdfThroughput.value.x > FastBrdfEps ? dLoss_dBrdfNumerator.x / brdfThroughput.value.x : 0.0f,
-        brdfThroughput.value.y > FastBrdfEps ? dLoss_dBrdfNumerator.y / brdfThroughput.value.y : 0.0f,
-        brdfThroughput.value.z > FastBrdfEps ? dLoss_dBrdfNumerator.z / brdfThroughput.value.z : 0.0f);
-    path.currentRayPayload.interaction.materialGrad.dAlbedo += dLoss_dBrdf * brdfThroughput.dBrdf_dAlbedo;
-    path.currentRayPayload.interaction.materialGrad.dRoughness += dot(dLoss_dBrdf, brdfThroughput.dBrdf_dRoughness);
+    if (validNextPath) {
+        const float3 dLoss_dBrdfNumerator =
+            path.accumulatedLightingGrad * path.accumulatedLighting;
+        const float3 dLoss_dBrdf = make_float3(
+            brdfThroughput.value.x > FastBrdfEps ? dLoss_dBrdfNumerator.x / brdfThroughput.value.x : 0.0f,
+            brdfThroughput.value.y > FastBrdfEps ? dLoss_dBrdfNumerator.y / brdfThroughput.value.y : 0.0f,
+            brdfThroughput.value.z > FastBrdfEps ? dLoss_dBrdfNumerator.z / brdfThroughput.value.z : 0.0f);
+        path.currentRayPayload.interaction.materialGrad.dAlbedo += dLoss_dBrdf * brdfThroughput.dBrdf_dAlbedo;
+        path.currentRayPayload.interaction.materialGrad.dRoughness += dot(dLoss_dBrdf, brdfThroughput.dBrdf_dRoughness);
 #ifdef ENABLE_METALLIC
-    path.currentRayPayload.interaction.materialGrad.dMetallic += dot(dLoss_dBrdf, brdfThroughput.dBrdf_dMetallic);
+        path.currentRayPayload.interaction.materialGrad.dMetallic += dot(dLoss_dBrdf, brdfThroughput.dBrdf_dMetallic);
 #endif
-
-    path.pendingRayDirectionGrad.set(
-        currentRay,
-        1.0f - path.currentRayPayload.transmittance,
-        path.currentRayPayload.lastHitDistance,
-        brdfThroughput.dNextDir_dRoughness,
-        path.numBounces);
+    }
 
     if (path.numBounces > 1u) {
         rayIntersectBwd<true>(
@@ -614,6 +699,7 @@ static __device__ __inline__ void sampleBrdfNextDirectionBwd(
             1.0f - path.currentRayPayload.transmittance,
             path.currentRayPayload.lastHitDistance,
             path.currentRayPayload.interaction.materialGrad,
+            path.currentRayPayload.interaction.selectedParticleId,
             pipelineParams);
     } else {
         rayIntersectBwd<false>(
@@ -621,7 +707,14 @@ static __device__ __inline__ void sampleBrdfNextDirectionBwd(
             1.0f - path.currentRayPayload.transmittance,
             path.currentRayPayload.lastHitDistance,
             path.currentRayPayload.interaction.materialGrad,
+            path.currentRayPayload.interaction.selectedParticleId,
             pipelineParams);
+    }
+
+    if (!validNextPath) {
+        path.pathThroughput = make_float3(0.0f);
+        path.active = 0u;
+        return;
     }
 
     path.pathThroughput = nextPathThroughput;

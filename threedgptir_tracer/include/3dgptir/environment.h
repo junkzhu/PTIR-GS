@@ -14,6 +14,24 @@ enum EnvironmentType {
     EnvironmentType_Cube = 1,
 };
 
+struct NativeSGEnvironment {
+#if defined(NVDR_TORCH) && !defined(__CUDACC__)
+    NativeSGEnvironment()
+        : lobes(nullptr), sampling(nullptr), numLobes(0) {
+    }
+
+    NativeSGEnvironment(
+        const torch::Tensor& lobeParameters,
+        const torch::Tensor& samplingDistribution);
+#endif
+
+    // Lobe layout: [axis.xyz, sharpness, amplitude.rgb].
+    const float* lobes;
+    // Sampling layout: [normalization Z_k, mixture probability alpha_k].
+    const float* sampling;
+    int numLobes;
+};
+
 struct EnvAliasTable {
 #if defined(NVDR_TORCH) && !defined(__CUDACC__)
     EnvAliasTable()

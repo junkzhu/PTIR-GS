@@ -41,10 +41,11 @@ static __device__ __forceinline__ bool hasTopLevelLightAliasTable() {
 }
 
 static __device__ __forceinline__ bool hasEnvironmentLight() {
-    return params.environment.data != nullptr
-        && params.environment.width > 0
-        && params.environment.height > 0
-        && params.environment.aliasTable.numCells > 0;
+    return hasNativeSGEnvironment()
+        || (params.environment.data != nullptr
+            && params.environment.width > 0
+            && params.environment.height > 0
+            && params.environment.aliasTable.numCells > 0);
 }
 
 static __device__ __forceinline__ unsigned int packedLightType(
@@ -81,7 +82,9 @@ static __device__ __forceinline__ LightSample sampleEnvLight(
         return sample;
     }
     float envPdf = 0.0f;
-    sample.wi = sampleEnvironmentAliasDirection(sampler, envPdf);
+    sample.wi = hasNativeSGEnvironment()
+        ? sampleNativeSGEnvironmentDirection(sampler, envPdf)
+        : sampleEnvironmentAliasDirection(sampler, envPdf);
     sample.Li = getBackgroundColor(sample.wi);
     sample.pdf = selectPdf * envPdf;
     sample.dist = 1e20f;
@@ -346,7 +349,11 @@ static __device__ __forceinline__ float lightEntryPdf(
     const unsigned int lightId) {
     switch (lightType) {
     case LightSamplerType_Env:
-        return hasEnvironmentLight() ? environmentAliasPdf(wi) : 0.0f;
+        return hasEnvironmentLight()
+            ? (hasNativeSGEnvironment()
+                ? nativeSGEnvironmentPdf(wi)
+                : environmentAliasPdf(wi))
+            : 0.0f;
     case LightSamplerType_Sphere:
         return sphereLightPdf(position, wi, lightId);
     case LightSamplerType_Mesh:
@@ -386,7 +393,11 @@ static __device__ __forceinline__ float lightSamplerPdf(
     const float3& position,
     const float3& wi) {
     if (!hasTopLevelLightAliasTable()) {
-        return hasEnvironmentLight() ? environmentAliasPdf(wi) : 0.0f;
+        return hasEnvironmentLight()
+            ? (hasNativeSGEnvironment()
+                ? nativeSGEnvironmentPdf(wi)
+                : environmentAliasPdf(wi))
+            : 0.0f;
     }
 
     float pdf = 0.0f;

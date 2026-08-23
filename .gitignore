@@ -9,6 +9,7 @@ runs/
 extra_info/
 wandb/
 outputs/
+outputs_backup/
 extra_info/
 eval/
 extra_info/

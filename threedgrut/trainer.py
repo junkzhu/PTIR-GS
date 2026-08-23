@@ -320,7 +320,11 @@ class Trainer3DGRUT:
         Renderer._set_model_environment(
             self.model, self.environment.get_environment_parameter()
         )
-        if self.conf.render.method == "3dgptir" and self.conf.render.enable_mis:
+        if (
+            self.conf.render.method == "3dgptir"
+            and self.conf.render.enable_mis
+            and not Renderer._uses_native_sg(self.conf, self.model)
+        ):
             self.rebuild_environment_alias_table(log=True)
 
     @torch.no_grad()
@@ -355,7 +359,11 @@ class Trainer3DGRUT:
         Renderer._set_model_environment(
             self.model, self.environment.get_environment_parameter()
         )
-        if self.conf.render.method == "3dgptir" and self.conf.render.enable_mis:
+        if (
+            self.conf.render.method == "3dgptir"
+            and self.conf.render.enable_mis
+            and not Renderer._uses_native_sg(self.conf, self.model)
+        ):
             self.rebuild_environment_alias_table(log=True)
         else:
             self.environment_alias_table = None
@@ -1784,6 +1792,7 @@ class Trainer3DGRUT:
             self.environment is not None
             and self.conf.render.method == "3dgptir"
             and self.conf.render.enable_mis
+            and not Renderer._uses_native_sg(self.conf, self.model)
             and OmegaConf.select(self.conf, "model.optimize_environment", default=False)
             and self.conf.model.alias_table_update_frequency > 0
             and global_step % self.conf.model.alias_table_update_frequency == 0
@@ -1809,6 +1818,10 @@ class Trainer3DGRUT:
         if "backward_render" in self.model.renderer.timings:
             batch_metrics["timings"]["backward_render_cuda"] = (
                 self.model.renderer.timings["backward_render"]
+            )
+        if "sg_sampling_distribution_update" in self.model.renderer.timings:
+            batch_metrics["timings"]["sg_sampling_distribution_update_cuda"] = (
+                self.model.renderer.timings["sg_sampling_distribution_update"]
             )
         metrics.append(batch_metrics)
 

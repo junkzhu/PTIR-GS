@@ -13,9 +13,9 @@ BOUNCE_VALUES=(2 3 5 8 10)
 
 OUT_DIR="outputs/tensoir"
 SPP_INVERSION_OUT_ROOT="outputs/tensoir_inversion_spp"
-BOUNCE_INVERSION_OUT_ROOT="outputs/tensoir_max_bounces"
+BOUNCE_INVERSION_OUT_ROOT="outputs/tensoir_bounces"
 RENDER_FRAME_STRIDE=5
-FIXED_EVAL_MAX_BOUNCES=10
+FIXED_EVAL_RENDER_BOUNCES=10
 DATASET_CONFIG="tensoir"
 INVERSION_CONFIG_NAME="inversions/nerf_synthetic_3dgptir.yaml"
 INVERSION_EXTRA_ARGS=()
@@ -29,7 +29,7 @@ Options:
   --no_albedo_prior      Disable albedo prior regularization for all PTIR inversion tasks.
   --no_roughness_prior   Disable roughness prior regularization for all PTIR inversion tasks.
   --inversion_args "ARGS" Extra Hydra args appended to every PTIR inversion task.
-  --eval_max_bounces N   Fixed render.max_bounces for post-inversion render/relight metrics. Default: $FIXED_EVAL_MAX_BOUNCES
+  --eval_render_bounces N  Fixed render.render_bounces for post-inversion render/relight metrics. Default: $FIXED_EVAL_RENDER_BOUNCES
   -h, --help             Show this help.
 
 Example:
@@ -63,12 +63,12 @@ while [[ $# -gt 0 ]]; do
             INVERSION_EXTRA_ARGS+=("${parsed_inversion_args[@]}")
             shift 2
             ;;
-        --eval_max_bounces)
+        --eval_render_bounces)
             if [[ $# -lt 2 ]]; then
-                echo "Missing value for --eval_max_bounces"
+                echo "Missing value for --eval_render_bounces"
                 exit 1
             fi
-            FIXED_EVAL_MAX_BOUNCES="$2"
+            FIXED_EVAL_RENDER_BOUNCES="$2"
             shift 2
             ;;
         -h|--help)
@@ -173,7 +173,7 @@ run_worker() {
                 --scenes "$scene" \
                 --render_frame_stride "$RENDER_FRAME_STRIDE" \
                 --no_precompile \
-                --render_args "--override render.max_bounces=$FIXED_EVAL_MAX_BOUNCES" \
+                --render_args "--override render.render_bounces=$FIXED_EVAL_RENDER_BOUNCES" \
                 --inversion_args "$override"
         fi
 
@@ -232,7 +232,7 @@ done
 
 echo "[$(date '+%F %T')] GPUs: $(join_by_comma "${CUDA_DEVICES[@]}")"
 echo "[$(date '+%F %T')] Queue files: $QUEUE_DIR"
-echo "[$(date '+%F %T')] Fixed eval render.max_bounces: $FIXED_EVAL_MAX_BOUNCES"
+echo "[$(date '+%F %T')] Fixed eval render.render_bounces: $FIXED_EVAL_RENDER_BOUNCES"
 if [[ ${#INVERSION_EXTRA_ARGS[@]} -gt 0 ]]; then
     printf "[%s] Extra inversion args:" "$(date '+%F %T')"
     printf " %q" "${INVERSION_EXTRA_ARGS[@]}"

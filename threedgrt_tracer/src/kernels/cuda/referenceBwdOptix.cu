@@ -128,7 +128,12 @@ extern "C" __global__ void __raygen__rg() {
 
     float2 minMaxT   = intersectAABB(params.aabb, rayOrigin, rayDirection);
     float startT     = fmaxf(0.0f, minMaxT.x - epsT);
-    const float endT = fminf(rayMaxHitDistance, minMaxT.y) + epsT;
+    // The intersection programs use a strict hitDistance < maxHitDistance test.
+    // A fixed epsilon is often smaller than one float ULP at scene scale, so
+    // adding epsT can leave the bound unchanged and exclude the final hit from
+    // the backward replay. Advance by exactly one representable float instead.
+    const float endT =
+        nextafterf(fminf(rayMaxHitDistance, minMaxT.y), RayHit::InfiniteDistance);
 
     float3 rayRadiance     = make_float3(0.f);
     float rayTransmittance = 1.f;

@@ -16,7 +16,7 @@ DATASET_CONFIG="mipnerf360"
 FORCE_TRAIN=false
 GLOBAL_DOWNSAMPLE_FACTOR=""
 BACKGROUND_COLOR="white"
-SCENES=(bicycle bonsai counter flowers garden kitchen room stump treehill)
+SCENES=(garden kitchen)
 EXTRA_ARGS=()
 INVERSION_EXTRA_ARGS=()
 
@@ -229,6 +229,7 @@ run_scene() {
     local data_factor=""
     local log_file="$OUT_DIR/logs/train_${scene}.log"
     local checkpoint_path=""
+    local scene_args=()
 
     if [[ ! -d "$scene_path" ]]; then
         echo "[$(date '+%F %T')] Scene path does not exist, skipping: $scene_path"
@@ -236,6 +237,10 @@ run_scene() {
     fi
 
     data_factor="$(scene_downsample_factor "$scene")"
+
+    if [[ "$scene" == "garden" || "$scene" == "kitchen" ]]; then
+        scene_args+=("loss.use_normal_prior_regularization=true")
+    fi
 
     checkpoint_path="$(find_latest_checkpoint "$scene" || true)"
     if [[ -n "$checkpoint_path" && "$FORCE_TRAIN" != true ]]; then
@@ -253,6 +258,8 @@ run_scene() {
             echo "model.background.color=$BACKGROUND_COLOR"
             echo "out_dir=$OUT_DIR"
             echo "experiment_name=$scene"
+            printf 'scene_args=%q ' "${scene_args[@]}"
+            echo
             printf 'extra_args=%q ' "${EXTRA_ARGS[@]}"
             echo
             nvidia-smi || true
@@ -264,6 +271,7 @@ run_scene() {
                 "experiment_name=$scene" \
                 "dataset.downsample_factor=$data_factor" \
                 "model.background.color=$BACKGROUND_COLOR" \
+                "${scene_args[@]}" \
                 "${EXTRA_ARGS[@]}"
         } > "$log_file" 2>&1
         echo "[$(date '+%F %T')] Finished training scene=$scene on CUDA_VISIBLE_DEVICES=$gpu_id"

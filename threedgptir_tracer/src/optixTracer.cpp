@@ -237,6 +237,22 @@ Environment::Environment(const torch::Tensor& environment, const torch::Tensor& 
     this->aliasTable = EnvAliasTable(aliasTable);
 }
 
+NativeSGEnvironment::NativeSGEnvironment(
+    const torch::Tensor& lobeParameters,
+    const torch::Tensor& samplingDistribution)
+    : lobes(nullptr), sampling(nullptr), numLobes(0) {
+    if (lobeParameters.dim() == 2
+        && lobeParameters.size(0) > 0
+        && lobeParameters.size(1) == 7
+        && samplingDistribution.dim() == 2
+        && samplingDistribution.size(0) == lobeParameters.size(0)
+        && samplingDistribution.size(1) == 2) {
+        lobes = lobeParameters.data_ptr<float>();
+        sampling = samplingDistribution.data_ptr<float>();
+        numLobes = static_cast<int>(lobeParameters.size(0));
+    }
+}
+
 std::vector<std::string> OptixTracer::generateDefines(
     float particleKernelDegree,
     bool particleKernelDensityClamping,
@@ -245,7 +261,9 @@ std::vector<std::string> OptixTracer::generateDefines(
     bool enableHitCounts,
     bool enableMIS,
     bool enableMetallic,
-    bool enableVisualizeLights) {
+    bool enableVisualizeLights,
+    bool enableRussianRoulette,
+    bool enableDiscreteModel) {
     std::vector<std::string> defines;
     if (_state) {
         defines.emplace_back("-DPARTICLE_KERNEL_DEGREE=" + std::to_string(static_cast<int32_t>(particleKernelDegree)));
@@ -263,6 +281,12 @@ std::vector<std::string> OptixTracer::generateDefines(
         }
         if (enableVisualizeLights) {
             defines.emplace_back("-DENABLE_VISUALIZE_LIGHTS");
+        }
+        if (enableRussianRoulette) {
+            defines.emplace_back("-DENABLE_RUSSIAN_ROULETTE");
+        }
+        if (enableDiscreteModel) {
+            defines.emplace_back("-DENABLE_DISCRETE_MODEL");
         }
         defines.emplace_back("-DSPH_MAX_NUM_COEFFS=" + std::to_string((_state->particleRadianceSphDegree + 1) * (_state->particleRadianceSphDegree + 1)));
         defines.emplace_back("-DPARTICLE_PRIMITIVE_TYPE=" + std::to_string(_state->gPrimType));
@@ -285,7 +309,9 @@ OptixTracer::OptixTracer(
     bool enableHitCounts,
     bool enableMIS,
     bool enableMetallic,
-    bool enableVisualizeLights) {
+    bool enableVisualizeLights,
+    bool enableRussianRoulette,
+    bool enableDiscreteModel) {
 
     _state = new State();
     memset(_state, 0, sizeof(State));
@@ -320,8 +346,17 @@ OptixTracer::OptixTracer(
     _state->gPrimNumVert                  = 0;
     _state->gPrimNumTri                   = 0;
 
-    std::vector<std::string> defines = generateDefines(particleKernelDegree, particleKernelDensityClamping,
-                                                       particleRadianceSphDegree, enableNormals, enableHitCounts, enableMIS, enableMetallic, enableVisualizeLights);
+    std::vector<std::string> defines = generateDefines(
+        particleKernelDegree,
+        particleKernelDensityClamping,
+        particleRadianceSphDegree,
+        enableNormals,
+        enableHitCounts,
+        enableMIS,
+        enableMetallic,
+        enableVisualizeLights,
+        enableRussianRoulette,
+        enableDiscreteModel);
 
     const uint32_t sharedFlags =
         (_state->gPrimType == MOGTracingSphere ? PipelineFlag_SpherePrim : ((_state->gPrimType == MOGTracingCustom) || (_state->gPrimType == MOGTracingInstances) ? PipelineFlag_HasIS : 0));
@@ -917,6 +952,8 @@ OptixTracer::trace(uint32_t frameNumber,
                    torch::Tensor particleShadingNormal,
                    torch::Tensor environment,
                    torch::Tensor environmentAliasTable,
+                   torch::Tensor sgEnvironment,
+                   torch::Tensor sgSamplingDistribution,
                    torch::Tensor lights,
                    torch::Tensor lightAliasTable,
                    torch::Tensor meshLightVertices,
@@ -984,6 +1021,7 @@ OptixTracer::trace(uint32_t frameNumber,
     paramsHost.rayPbrComponents = packed_accessor32<float, 5>(rayPbrComponents);
 
     paramsHost.environment = Environment(environment, environmentAliasTable);
+    paramsHost.sgEnvironment = NativeSGEnvironment(sgEnvironment, sgSamplingDistribution);
     paramsHost.numLights = lights.size(0);
     paramsHost.lights    = packed_accessor32<float, 2>(lights);
     paramsHost.numLightEntries = lightAliasTable.size(1);
@@ -1012,7 +1050,7 @@ OptixTracer::trace(uint32_t frameNumber,
         rayRad, rayDns, rayHit, rayHitSecondMoment, rayDepthDistortion, rayNrm, rayShadingNrm, rayMaterial, rayHitsCount, particleVisibility, rayPbr, rayLight, rayPbrComponents);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 OptixTracer::traceBwd(uint32_t frameNumber,
                       torch::Tensor rayToWorld,
                       torch::Tensor rayOri,
@@ -1033,6 +1071,8 @@ OptixTracer::traceBwd(uint32_t frameNumber,
                       torch::Tensor particleShadingNormal,
                       torch::Tensor environment,
                       torch::Tensor environmentAliasTable,
+                      torch::Tensor sgEnvironment,
+                      torch::Tensor sgSamplingDistribution,
                       torch::Tensor lights,
                       torch::Tensor lightAliasTable,
                       torch::Tensor meshLightVertices,
@@ -1061,6 +1101,7 @@ OptixTracer::traceBwd(uint32_t frameNumber,
     torch::Tensor particleShadingNormalGrad = torch::zeros({particleShadingNormal.size(0), particleShadingNormal.size(1)}, opts);
     torch::Tensor particleVisibility = torch::zeros({particleDensity.size(0), 1}, opts);
     torch::Tensor environmentGrad = torch::zeros_like(environment);
+    torch::Tensor sgEnvironmentGrad = torch::zeros_like(sgEnvironment);
 
     PipelineBackwardParameters paramsHost;
     paramsHost.handle = _state->gasHandle;
@@ -1116,8 +1157,10 @@ OptixTracer::traceBwd(uint32_t frameNumber,
     paramsHost.rayPbrGrad         = packed_accessor32<float, 4>(rayPbrGrd);
     paramsHost.rayLightGrad       = packed_accessor32<float, 4>(rayLightGrd);
     paramsHost.environmentGrad    = packed_accessor32<float, 3>(environmentGrad);
+    paramsHost.sgEnvironmentGrad  = packed_accessor32<float, 2>(sgEnvironmentGrad);
 
     paramsHost.environment = Environment(environment, environmentAliasTable);
+    paramsHost.sgEnvironment = NativeSGEnvironment(sgEnvironment, sgSamplingDistribution);
     paramsHost.numLights = lights.size(0);
     paramsHost.lights    = packed_accessor32<float, 2>(lights);
     paramsHost.numLightEntries = lightAliasTable.size(1);
@@ -1140,6 +1183,11 @@ OptixTracer::traceBwd(uint32_t frameNumber,
                             sizeof(PipelineBackwardParameters), &_state->sbtTracingBwd,
                             rayRad.size(2), rayRad.size(1), rayRad.size(0)));
 
-    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(
-        particleDensityGrad, particleMaterialGrad, particleRadianceGrad, particleShadingNormalGrad, environmentGrad);
+    return std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(
+        particleDensityGrad,
+        particleMaterialGrad,
+        particleRadianceGrad,
+        particleShadingNormalGrad,
+        environmentGrad,
+        sgEnvironmentGrad);
 }

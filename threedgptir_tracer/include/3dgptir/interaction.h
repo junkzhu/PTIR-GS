@@ -21,6 +21,8 @@
 
 struct Interaction {
 #ifdef __CUDACC__
+    static constexpr unsigned int InvalidParticleId = 0xFFFFFFFFu;
+
     __device__ Interaction()
         : Interaction(make_float3(0.f, 0.f, 0.f), make_float3(0.f, 0.f, 0.f), Material(), false) {
     }
@@ -42,6 +44,7 @@ struct Interaction {
         this->shadingnormal = shadingnormal;
         this->material      = material;
         this->materialGrad  = MaterialGrad();
+        this->selectedParticleId = InvalidParticleId;
     }
 
     __device__ Interaction(
@@ -65,6 +68,7 @@ struct Interaction {
             integratedShadingnormal.z * invOpacity);
         material     = Material(integratedMaterial, invOpacity);
         materialGrad = MaterialGrad();
+        selectedParticleId = InvalidParticleId;
     }
 #endif
 
@@ -73,4 +77,5 @@ struct Interaction {
     float3 shadingnormal;
     Material material;
     MaterialGrad materialGrad;
+    unsigned int selectedParticleId;
 };
