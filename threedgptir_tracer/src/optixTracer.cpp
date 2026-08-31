@@ -256,6 +256,7 @@ NativeSGEnvironment::NativeSGEnvironment(
 std::vector<std::string> OptixTracer::generateDefines(
     float particleKernelDegree,
     bool particleKernelDensityClamping,
+    float maxSelfOcclusionOffset,
     int particleRadianceSphDegree,
     bool enableNormals,
     bool enableHitCounts,
@@ -278,6 +279,10 @@ std::vector<std::string> OptixTracer::generateDefines(
         }
         if (enableMetallic) {
             defines.emplace_back("-DENABLE_METALLIC");
+            // Glossy metallic paths are more likely to expose degenerate
+            // learned normals or near-delta GGX samples. Keep non-finite BRDF
+            // values and directions out of subsequent OptiX traces.
+            defines.emplace_back("-DFAST_BRDF_GUARD_NAN");
         }
         if (enableVisualizeLights) {
             defines.emplace_back("-DENABLE_VISUALIZE_LIGHTS");
@@ -291,6 +296,8 @@ std::vector<std::string> OptixTracer::generateDefines(
         defines.emplace_back("-DSPH_MAX_NUM_COEFFS=" + std::to_string((_state->particleRadianceSphDegree + 1) * (_state->particleRadianceSphDegree + 1)));
         defines.emplace_back("-DPARTICLE_PRIMITIVE_TYPE=" + std::to_string(_state->gPrimType));
         defines.emplace_back("-DPARTICLE_PRIMITIVE_CLAMPED=" + std::to_string(particleKernelDensityClamping ? 1 : 0));
+        defines.emplace_back(
+            "-DMAX_SELF_OCCLUSION_OFFSET=" + std::to_string(maxSelfOcclusionOffset));
     }
     return defines;
 }
@@ -304,6 +311,7 @@ OptixTracer::OptixTracer(
     float particleKernelDegree,
     float particleKernelMinResponse,
     bool particleKernelDensityClamping,
+    float maxSelfOcclusionOffset,
     int particleRadianceSphDegree,
     bool enableNormals,
     bool enableHitCounts,
@@ -349,6 +357,7 @@ OptixTracer::OptixTracer(
     std::vector<std::string> defines = generateDefines(
         particleKernelDegree,
         particleKernelDensityClamping,
+        maxSelfOcclusionOffset,
         particleRadianceSphDegree,
         enableNormals,
         enableHitCounts,
@@ -400,6 +409,8 @@ OptixTracer::~OptixTracer(void) {
 
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->gasBuffer)));
     CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->gasBufferTmp)));
+    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->sceneMeshBuffer)));
+    CUDA_CHECK(cudaFree(reinterpret_cast<void*>(_state->sceneMeshBufferTmp)));
     OPTIX_CHECK(optixDeviceContextDestroy(_state->context));
 
     delete _state;
@@ -430,7 +441,8 @@ void OptixTracer::createPipeline(const OptixDeviceContext context,
         pipeline_compile_options.usesMotionBlur                   = false;
         pipeline_compile_options.traversableGraphFlags            = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
         pipeline_compile_options.numPayloadValues                 = numPayloadValues;
-        pipeline_compile_options.numAttributeValues               = 0;
+        // Built-in triangle closest-hit programs expose two barycentrics.
+        pipeline_compile_options.numAttributeValues               = 2;
         pipeline_compile_options.exceptionFlags                   = OPTIX_EXCEPTION_FLAG_NONE;
         pipeline_compile_options.pipelineLaunchParamsVariableName = "params";
         pipeline_compile_options.usesPrimitiveTypeFlags           = OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE;
@@ -466,6 +478,7 @@ void OptixTracer::createPipeline(const OptixDeviceContext context,
     OptixProgramGroup raygen_prog_group   = nullptr;
     OptixProgramGroup miss_prog_group     = nullptr;
     OptixProgramGroup hitgroup_prog_group = nullptr;
+    OptixProgramGroup mesh_hitgroup_prog_group = nullptr;
 
     {
         OptixProgramGroupOptions program_group_options = {}; // Initialize to zeros
@@ -513,6 +526,20 @@ void OptixTracer::createPipeline(const OptixDeviceContext context,
         OPTIX_CHECK_LOG(optixProgramGroupCreate(context, &hitgroup_prog_group_desc,
                                                 1, // num program groups
                                                 &program_group_options, log, &sizeof_log, &hitgroup_prog_group));
+
+        OptixProgramGroupDesc mesh_hitgroup_prog_group_desc = {};
+        mesh_hitgroup_prog_group_desc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+        mesh_hitgroup_prog_group_desc.hitgroup.moduleCH = *module;
+        mesh_hitgroup_prog_group_desc.hitgroup.entryFunctionNameCH = "__closesthit__mesh";
+        sizeof_log = sizeof(log);
+        OPTIX_CHECK_LOG(optixProgramGroupCreate(
+            context,
+            &mesh_hitgroup_prog_group_desc,
+            1,
+            &program_group_options,
+            log,
+            &sizeof_log,
+            &mesh_hitgroup_prog_group));
     }
 
     //
@@ -525,6 +552,7 @@ void OptixTracer::createPipeline(const OptixDeviceContext context,
         program_groups.push_back(raygen_prog_group);
         program_groups.push_back(miss_prog_group);
         program_groups.push_back(hitgroup_prog_group);
+        program_groups.push_back(mesh_hitgroup_prog_group);
 
         // OptixProgramGroup program_groups[] = { raygen_prog_group, miss_prog_group, hitgroup_prog_group };
 
@@ -576,11 +604,12 @@ void OptixTracer::createPipeline(const OptixDeviceContext context,
 
         CUdeviceptr hitgroup_record;
         size_t hitgroup_record_size = sizeof(HitGroupSbtRecord);
-        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&hitgroup_record), hitgroup_record_size));
-        HitGroupSbtRecord hg_sbt;
-        OPTIX_CHECK(optixSbtRecordPackHeader(hitgroup_prog_group, &hg_sbt));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&hitgroup_record), 2 * hitgroup_record_size));
+        HitGroupSbtRecord hg_sbt[2];
+        OPTIX_CHECK(optixSbtRecordPackHeader(hitgroup_prog_group, &hg_sbt[0]));
+        OPTIX_CHECK(optixSbtRecordPackHeader(mesh_hitgroup_prog_group, &hg_sbt[1]));
         CUDA_CHECK(cudaMemcpy(
-            reinterpret_cast<void*>(hitgroup_record), &hg_sbt, hitgroup_record_size, cudaMemcpyHostToDevice));
+            reinterpret_cast<void*>(hitgroup_record), &hg_sbt, 2 * hitgroup_record_size, cudaMemcpyHostToDevice));
 
         sbt.raygenRecord                = raygen_record;
         sbt.missRecordBase              = miss_record;
@@ -588,7 +617,7 @@ void OptixTracer::createPipeline(const OptixDeviceContext context,
         sbt.missRecordCount             = 1;
         sbt.hitgroupRecordBase          = hitgroup_record;
         sbt.hitgroupRecordStrideInBytes = sizeof(HitGroupSbtRecord);
-        sbt.hitgroupRecordCount         = 1;
+        sbt.hitgroupRecordCount         = 2;
     }
 }
 
@@ -665,6 +694,82 @@ void OptixTracer::reallocateParamsDevice(size_t sz, cudaStream_t cudaStream) {
     }
 }
 
+void OptixTracer::buildSceneMeshBVH(
+    const torch::Tensor& vertices,
+    const torch::Tensor& triangles,
+    cudaStream_t cudaStream) {
+    _state->sceneMeshHandle = 0;
+    _state->sceneMeshNumTriangles = 0;
+    if (vertices.numel() == 0 || triangles.numel() == 0) {
+        return;
+    }
+
+    TORCH_CHECK(vertices.is_cuda() && vertices.is_contiguous(),
+                "scene mesh vertices must be a contiguous CUDA tensor");
+    TORCH_CHECK(vertices.scalar_type() == torch::kFloat32 && vertices.dim() == 2 && vertices.size(1) == 3,
+                "scene mesh vertices must have shape [V, 3] and dtype float32");
+    TORCH_CHECK(triangles.is_cuda() && triangles.is_contiguous(),
+                "scene mesh triangles must be a contiguous CUDA tensor");
+    TORCH_CHECK(triangles.scalar_type() == torch::kInt32 && triangles.dim() == 2 && triangles.size(1) == 3,
+                "scene mesh triangles must have shape [T, 3] and dtype int32");
+
+    CUdeviceptr vertexBuffer = reinterpret_cast<CUdeviceptr>(vertices.data_ptr<float>());
+    OptixBuildInput buildInput = {};
+    uint32_t geometryFlags = OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT;
+    buildInput.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
+    buildInput.triangleArray.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
+    buildInput.triangleArray.vertexStrideInBytes = sizeof(float3);
+    buildInput.triangleArray.numVertices = static_cast<unsigned int>(vertices.size(0));
+    buildInput.triangleArray.vertexBuffers = &vertexBuffer;
+    buildInput.triangleArray.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
+    buildInput.triangleArray.indexStrideInBytes = sizeof(int3);
+    buildInput.triangleArray.numIndexTriplets = static_cast<unsigned int>(triangles.size(0));
+    buildInput.triangleArray.indexBuffer = reinterpret_cast<CUdeviceptr>(triangles.data_ptr<int32_t>());
+    buildInput.triangleArray.flags = &geometryFlags;
+    buildInput.triangleArray.numSbtRecords = 1;
+
+    OptixAccelBuildOptions accelOptions = {};
+    accelOptions.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+    accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
+
+    OptixAccelBufferSizes bufferSizes = {};
+    OPTIX_CHECK(optixAccelComputeMemoryUsage(
+        _state->context, &accelOptions, &buildInput, 1, &bufferSizes));
+    reallocateBuffer(
+        &_state->sceneMeshBufferTmp,
+        _state->sceneMeshBufferTmpSz,
+        bufferSizes.tempSizeInBytes,
+        cudaStream);
+    reallocateBuffer(
+        &_state->sceneMeshBuffer,
+        _state->sceneMeshBufferSz,
+        bufferSizes.outputSizeInBytes,
+        cudaStream);
+
+    OPTIX_CHECK(optixAccelBuild(
+        _state->context,
+        cudaStream,
+        &accelOptions,
+        &buildInput,
+        1,
+        _state->sceneMeshBufferTmp,
+        bufferSizes.tempSizeInBytes,
+        _state->sceneMeshBuffer,
+        bufferSizes.outputSizeInBytes,
+        &_state->sceneMeshHandle,
+        nullptr,
+        0));
+    _state->sceneMeshNumTriangles = static_cast<uint32_t>(triangles.size(0));
+}
+
+void OptixTracer::buildSceneMeshBVH(
+    torch::Tensor vertices,
+    torch::Tensor triangles) {
+    cudaStream_t cudaStream = at::cuda::getCurrentCUDAStream();
+    buildSceneMeshBVH(vertices, triangles, cudaStream);
+    CUDA_CHECK_LAST();
+}
+
 void OptixTracer::buildBVH(torch::Tensor mogPos,
                            torch::Tensor mogRot,
                            torch::Tensor mogScl,
@@ -672,7 +777,41 @@ void OptixTracer::buildBVH(torch::Tensor mogPos,
                            unsigned int rebuild,
                            bool allow_update) {
 
+    TORCH_CHECK(
+        mogPos.is_cuda() && mogRot.is_cuda() && mogScl.is_cuda() && mogDns.is_cuda(),
+        "Gaussian BVH inputs must be CUDA tensors");
+    TORCH_CHECK(
+        mogPos.is_contiguous() && mogRot.is_contiguous() && mogScl.is_contiguous() && mogDns.is_contiguous(),
+        "Gaussian BVH inputs must be contiguous");
+    TORCH_CHECK(
+        mogPos.scalar_type() == torch::kFloat32 && mogRot.scalar_type() == torch::kFloat32
+            && mogScl.scalar_type() == torch::kFloat32 && mogDns.scalar_type() == torch::kFloat32,
+        "Gaussian BVH inputs must use float32");
+    TORCH_CHECK(
+        mogPos.dim() == 2 && mogPos.size(1) == 3
+            && mogRot.dim() == 2 && mogRot.size(1) == 4
+            && mogScl.dim() == 2 && mogScl.size(1) == 3
+            && mogDns.dim() == 2 && mogDns.size(1) == 1,
+        "Gaussian BVH inputs must have shapes [N,3], [N,4], [N,3], and [N,1]");
+    TORCH_CHECK(
+        mogRot.size(0) == mogPos.size(0) && mogScl.size(0) == mogPos.size(0)
+            && mogDns.size(0) == mogPos.size(0),
+        "Gaussian BVH inputs must have matching counts");
+
     const uint32_t gNum = mogPos.size(0);
+    uint32_t maxInstances = 0;
+    OPTIX_CHECK(optixDeviceContextGetProperty(
+        _state->context,
+        OPTIX_DEVICE_PROPERTY_LIMIT_MAX_INSTANCES_PER_IAS,
+        &maxInstances,
+        sizeof(maxInstances)));
+    TORCH_CHECK(
+        _state->gPrimType != MOGTracingInstances || gNum <= maxInstances,
+        "Gaussian instance count ",
+        gNum,
+        " exceeds this GPU's OptiX IAS limit ",
+        maxInstances,
+        ". Use a non-instance primitive_type or prune the checkpoint.");
 
     const uint32_t primitiveOpts = _state->particleKernelDensityClamping ? MOGRenderOpts::MOGRenderAdaptiveKernelClamping : MOGRenderOpts::MOGRenderNone;
 
@@ -963,7 +1102,8 @@ OptixTracer::trace(uint32_t frameNumber,
                    uint32_t shIndirect,
                    int sphDegree,
                    float minTransmittance,
-                   uint32_t maxBounces) {
+                   uint32_t maxBounces,
+                   uint32_t enableSecondaryNee) {
 
     const torch::TensorOptions opts  = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     torch::Tensor rayRad             = torch::empty({rayOri.size(0), rayOri.size(1), rayOri.size(2), 3}, opts);
@@ -977,11 +1117,15 @@ OptixTracer::trace(uint32_t frameNumber,
     torch::Tensor rayHitsCount       = torch::zeros({rayOri.size(0), rayOri.size(1), rayOri.size(2), 1}, opts);
     torch::Tensor rayPbr             = torch::zeros({rayOri.size(0), rayOri.size(1), rayOri.size(2), 3}, opts);
     torch::Tensor rayLight           = torch::zeros({rayOri.size(0), rayOri.size(1), rayOri.size(2), 3}, opts);
-    torch::Tensor rayPbrComponents   = torch::zeros({rayOri.size(0), rayOri.size(1), rayOri.size(2), 2, 3}, opts);
+    torch::Tensor rayPbrComponents   = torch::zeros(
+        {rayOri.size(0), rayOri.size(1), rayOri.size(2), 2, 3}, opts);
     torch::Tensor particleVisibility = torch::zeros({particleDensity.size(0), 1}, opts);
+
+    cudaStream_t cudaStream = at::cuda::getCurrentCUDAStream();
 
     PipelineParameters paramsHost;
     paramsHost.handle = _state->gasHandle;
+    paramsHost.sceneMeshHandle = _state->sceneMeshHandle;
     paramsHost.aabb   = _state->gasAABB;
 
     paramsHost.frameBounds.x = rayOri.size(2) - 1;
@@ -995,6 +1139,7 @@ OptixTracer::trace(uint32_t frameNumber,
     paramsHost.sphDegree              = sphDegree;
     paramsHost.maxBounces             = shIndirect ? (maxBounces < 2u ? maxBounces : 2u) : maxBounces;
     paramsHost.renderOpts             = shIndirect;
+    paramsHost.enableSecondaryNee     = enableSecondaryNee;
 
     std::memcpy(&paramsHost.rayToWorld[0].x, rayToWorld.cpu().data_ptr<float>(), 3 * sizeof(float4));
     paramsHost.rayOrigin    = packed_accessor32<float, 4>(rayOri);
@@ -1030,11 +1175,11 @@ OptixTracer::trace(uint32_t frameNumber,
     paramsHost.meshLightVertices = packed_accessor32<float, 2>(meshLightVertices);
     paramsHost.numMeshLightTriangles = meshLightTriangles.size(0);
     paramsHost.meshLightTriangles = packed_accessor32<int32_t, 2>(meshLightTriangles);
+    paramsHost.numSceneMeshTriangles = _state->sceneMeshNumTriangles;
     paramsHost.numMeshLights = meshLights.size(0);
     paramsHost.meshLights = packed_accessor32<float, 2>(meshLights);
     paramsHost.meshLightTriangleAliasTable = packed_accessor32<float, 2>(meshLightTriangleAliasTable);
 
-    cudaStream_t cudaStream = at::cuda::getCurrentCUDAStream();
     reallocateParamsDevice(sizeof(paramsHost), cudaStream);
 
     CUDA_CHECK(cudaMemcpyAsync(
@@ -1092,7 +1237,8 @@ OptixTracer::traceBwd(uint32_t frameNumber,
                       uint32_t shIndirect,
                       int sphDegree,
                       float minTransmittance,
-                      uint32_t maxBounces) {
+                      uint32_t maxBounces,
+                      uint32_t enableSecondaryNee) {
 
     const torch::TensorOptions opts    = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
     torch::Tensor particleDensityGrad  = torch::zeros({particleDensity.size(0), particleDensity.size(1)}, opts);
@@ -1103,8 +1249,12 @@ OptixTracer::traceBwd(uint32_t frameNumber,
     torch::Tensor environmentGrad = torch::zeros_like(environment);
     torch::Tensor sgEnvironmentGrad = torch::zeros_like(sgEnvironment);
 
+    cudaStream_t cudaStream = at::cuda::getCurrentCUDAStream();
+    buildSceneMeshBVH(meshLightVertices, meshLightTriangles, cudaStream);
+
     PipelineBackwardParameters paramsHost;
     paramsHost.handle = _state->gasHandle;
+    paramsHost.sceneMeshHandle = _state->sceneMeshHandle;
     paramsHost.aabb   = _state->gasAABB;
 
     paramsHost.frameBounds.x = rayOri.size(2) - 1;
@@ -1118,6 +1268,7 @@ OptixTracer::traceBwd(uint32_t frameNumber,
     paramsHost.sphDegree              = sphDegree;
     paramsHost.maxBounces             = shIndirect ? (maxBounces < 2u ? maxBounces : 2u) : maxBounces;
     paramsHost.renderOpts             = shIndirect;
+    paramsHost.enableSecondaryNee     = enableSecondaryNee;
 
     std::memcpy(&paramsHost.rayToWorld[0].x, rayToWorld.cpu().data_ptr<float>(), 3 * sizeof(float4));
     paramsHost.rayOrigin    = packed_accessor32<float, 4>(rayOri);
@@ -1169,11 +1320,10 @@ OptixTracer::traceBwd(uint32_t frameNumber,
     paramsHost.meshLightVertices = packed_accessor32<float, 2>(meshLightVertices);
     paramsHost.numMeshLightTriangles = meshLightTriangles.size(0);
     paramsHost.meshLightTriangles = packed_accessor32<int32_t, 2>(meshLightTriangles);
+    paramsHost.numSceneMeshTriangles = _state->sceneMeshNumTriangles;
     paramsHost.numMeshLights = meshLights.size(0);
     paramsHost.meshLights = packed_accessor32<float, 2>(meshLights);
     paramsHost.meshLightTriangleAliasTable = packed_accessor32<float, 2>(meshLightTriangleAliasTable);
-
-    cudaStream_t cudaStream = at::cuda::getCurrentCUDAStream();
 
     reallocateParamsDevice(sizeof(paramsHost), cudaStream);
     CUDA_CHECK(cudaMemcpyAsync(

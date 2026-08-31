@@ -58,11 +58,13 @@ struct PipelineParameters {
     PackedTensorAccessor32<float, 2> meshLightVertices; ///< packed mesh-light vertices [V, 3]
     unsigned int numMeshLightTriangles;
     PackedTensorAccessor32<int32_t, 2> meshLightTriangles; ///< packed mesh-light triangles [T, 3]
+    unsigned int numSceneMeshTriangles; ///< triangles in the optional opaque mesh GAS
     unsigned int numMeshLights;
-    PackedTensorAccessor32<float, 2> meshLights; ///< packed mesh lights [M, 8]
+    PackedTensorAccessor32<float, 2> meshLights; ///< packed mesh/light surfaces [M, 14]
     PackedTensorAccessor32<float, 2> meshLightTriangleAliasTable; ///< triangle table [3, T]
 
     OptixTraversableHandle handle;
+    OptixTraversableHandle sceneMeshHandle; ///< optional opaque triangle geometry
     OptixAabb aabb;
 
     float minTransmittance;
@@ -72,6 +74,7 @@ struct PipelineParameters {
     unsigned int sphDegree;
     unsigned int maxBounces;
     unsigned int renderOpts;
+    unsigned int enableSecondaryNee;
 
     uint2 frameBounds;
     unsigned int frameNumber;

@@ -48,6 +48,11 @@ from threedgrut.model.ptir_helper import (
     save_scaled_albedo_checkpoint,
     summarize_ptir_metrics,
 )
+from threedgrut.relighting_sequence import (
+    DEFAULT_VIDEO_FPS,
+    RelightingSequence,
+    encode_aov_videos,
+)
 from threedgrut.utils.color_correct import color_correct_affine
 from threedgrut.utils.logger import logger
 from threedgrut.utils.misc import create_summary_writer
@@ -803,6 +808,165 @@ class Renderer:
             post_processing=post_processing,
             checkpoint_path=checkpoint_path,
         )
+
+    @torch.no_grad()
+    def render_relighting_sequence(
+        self,
+        sequence_dir: str | Path,
+        frame_stride: int = 1,
+        light_scale: float = 1.0,
+    ) -> Path:
+        """Render a JSON camera/light sequence without requiring paired GT images."""
+
+        frame_stride = self._validate_frame_stride(frame_stride)
+        sequence = RelightingSequence(sequence_dir, light_scale=light_scale)
+        frame_ids = sequence.frame_ids[::frame_stride]
+        if not frame_ids:
+            raise ValueError("Relighting sequence selected no frames")
+
+        # Sequence envmaps are equirectangular textures or constant colors. Make
+        # this explicit in case the checkpoint was trained with another
+        # environment parameterization (for example spherical Gaussians).
+        OmegaConf.update(self.conf, "environment.type", "2d", force_add=True)
+        OmegaConf.update(
+            self.conf, "environment.parameterization", "linear", force_add=True
+        )
+        self.model.optimize_environment = False
+        self.model.environment_parameterization = "linear"
+        self._set_model_environment(
+            self.model, sequence.make_environment(self.model.device)
+        )
+        self.model.environment_alias_table = None
+        self.compute_metrics = False
+
+        output_root = (
+            Path(self.out_dir)
+            / f"ours_{int(self.global_step)}"
+            / "relighting_sequence"
+            / sequence.directory.name
+        )
+        is_ptir = self.conf.render.method == "3dgptir"
+        output_names = (
+            ["pbr", "direct", "indirect", "light", "albedo", "roughness", "normals"]
+            if is_ptir
+            else ["renders", "normals"]
+        )
+        output_paths = {name: output_root / name for name in output_names}
+        for path in output_paths.values():
+            path.mkdir(parents=True, exist_ok=True)
+
+        metadata = {
+            "sequence": str(sequence.directory),
+            "coordinate_space": sequence.coordinate_space,
+            "output_coordinate_space": "rdf",
+            "frame_ids": frame_ids,
+            "frame_stride": frame_stride,
+            "light_scale": float(light_scale),
+            "environment_type": sequence.environment_type,
+            "environment_color": sequence.environment_color,
+            "environment_path": None
+            if sequence.environment_path is None
+            else str(sequence.environment_path),
+            "mesh_count": len(sequence.mesh_entries),
+            "gaussians_transform_present_but_ignored": sequence.has_gaussians_transform,
+        }
+        output_root.mkdir(parents=True, exist_ok=True)
+        with (output_root / "sequence.json").open("w", encoding="utf-8") as file:
+            json.dump(metadata, file, indent=2)
+
+        logger.info(
+            "Relighting sequence loaded: "
+            f"{sequence.directory} ({len(frame_ids)}/{len(sequence.frame_ids)} frames, "
+            f"{len(sequence.light_entries)} lights, {len(sequence.mesh_entries)} meshes, "
+            f"{sequence.intrinsics.width}x{sequence.intrinsics.height})"
+        )
+        if sequence.has_gaussians_transform:
+            logger.info(
+                "gaussians_transform.json is placement metadata and is intentionally ignored"
+            )
+        logger.start_progress(
+            task_name="Rendering relighting sequence",
+            total_steps=len(frame_ids),
+            color="orange1",
+        )
+
+        try:
+            for frame_id in frame_ids:
+                # Optional inference-time hook for applications that need to
+                # animate a subset of Gaussian parameters between sequence
+                # frames.  Normal renders leave this unset, so there is no
+                # change to the standard rendering path.
+                frame_transform = getattr(self, "frame_transform_callback", None)
+                if frame_transform is not None:
+                    frame_transform(frame_id)
+                frame_name = f"{frame_id:05d}.png"
+                batch = sequence.make_batch(frame_id, self.model.device)
+                self.model.lights = sequence.make_lights(frame_id, self.model.device)
+                batch = self._pack_lights_for_batch(batch)
+                outputs = self.model(batch, frame_id=frame_id)
+
+                if not is_ptir and self.post_processing is not None:
+                    outputs = apply_post_processing(
+                        self.post_processing, outputs, batch, training=False
+                    )
+
+                if is_ptir:
+                    aovs = {
+                        "pbr": outputs.get("pred_pbr"),
+                        "direct": outputs.get("pred_direct"),
+                        "indirect": outputs.get("pred_indirect"),
+                        "light": outputs.get("pred_light"),
+                    }
+                    if aovs["pbr"] is None:
+                        raise KeyError("3dgptir sequence render did not produce pred_pbr")
+                    for name, image in aovs.items():
+                        if image is not None:
+                            self._save_nhwc_image(
+                                image,
+                                str(output_paths[name] / frame_name),
+                                linear_to_srgb=True,
+                            )
+
+                    material = outputs.get("pred_material")
+                    if material is not None:
+                        self._save_nhwc_image(
+                            material[..., :3],
+                            str(output_paths["albedo"] / frame_name),
+                        )
+                        roughness = material[..., 3:4].repeat(1, 1, 1, 3)
+                        self._save_nhwc_image(
+                            roughness,
+                            str(output_paths["roughness"] / frame_name),
+                        )
+                else:
+                    self._save_nhwc_image(
+                        outputs["pred_rgb"],
+                        str(output_paths["renders"] / frame_name),
+                    )
+
+                normals = outputs.get("pred_shadingnormal")
+                if normals is None:
+                    normals = outputs.get("pred_normals")
+                if normals is not None:
+                    self._save_nhwc_image(
+                        (0.5 * (normals + 1.0)).clip(0.0, 1.0),
+                        str(output_paths["normals"] / frame_name),
+                    )
+
+                logger.log_progress(
+                    task_name="Rendering relighting sequence",
+                    advance=1,
+                    iteration=str(frame_id),
+                )
+        finally:
+            logger.end_progress(task_name="Rendering relighting sequence")
+
+        logger.info(f"Encoding relighting AOV videos at {DEFAULT_VIDEO_FPS} FPS")
+        videos = encode_aov_videos(output_paths)
+        for name, path in videos.items():
+            logger.info(f'{name} video saved to: "{path.resolve()}"')
+        logger.info(f'Relighting sequence saved to: "{output_root.resolve()}"')
+        return output_root
 
     @torch.no_grad()
     def render_all(self, frame_stride: int = 1):

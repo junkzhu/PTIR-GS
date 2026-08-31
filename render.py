@@ -60,6 +60,16 @@ if __name__ == "__main__":
         action="store_true",
         help="If set, render with the demo point/sphere/mesh lights.",
     )
+    relight_group.add_argument(
+        "--relighting-sequence",
+        type=str,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Render camera_seq.json and light_seq.json from DIR, using their "
+            "frame-number synchronization and RDF coordinate conversion."
+        ),
+    )
     parser.add_argument(
         "--environment-dir",
         type=str,
@@ -74,8 +84,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--visualize-lights",
-        action="store_true",
-        help="If set, make environment and visible lights contribute on escaped rays.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Make environment and visible lights contribute on escaped rays "
+            "[enabled by default; use --no-visualize-lights to disable]."
+        ),
     )
     parser.add_argument(
         "--render_frame_stride",
@@ -84,6 +98,15 @@ if __name__ == "__main__":
         help=(
             "Render every Nth test frame. Applies to normal, lights, and "
             "environment relight rendering. Default: 1."
+        ),
+    )
+    parser.add_argument(
+        "--relighting-light-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiply every JSON light's color*strength emission by this value. "
+            "Only used with --relighting-sequence. Default: 1.0."
         ),
     )
     parser.add_argument(
@@ -102,10 +125,17 @@ if __name__ == "__main__":
         parser.error("--environment-dir is required when --environment-relight is set")
     if args.environment_relight and args.environment_path:
         parser.error("--environment-path cannot be used with --environment-relight")
+    if args.relighting_sequence and args.environment_path:
+        parser.error(
+            "--environment-path cannot be used with --relighting-sequence; "
+            "the sequence envmap is used"
+        )
     if not args.environment_relight and not args.out_dir:
         parser.error("--out-dir is required unless --environment-relight is set")
     if args.render_frame_stride < 1:
         parser.error("--render_frame_stride must be >= 1")
+    if args.relighting_light_scale < 0:
+        parser.error("--relighting-light-scale must be >= 0")
 
     out_dir = args.out_dir
     if args.environment_relight and out_dir is None:
@@ -126,6 +156,23 @@ if __name__ == "__main__":
         renderer.render_relight_all(
             environment_dir=args.environment_dir,
             frame_stride=args.render_frame_stride,
+        )
+    elif args.relighting_sequence:
+        sequence_overrides = [*args.override, "render.enable_metallic=true"]
+        renderer = Renderer.from_checkpoint(
+            checkpoint_path=args.checkpoint,
+            path=args.path,
+            out_dir=out_dir,
+            save_gt=False,
+            computes_extra_metrics=False,
+            visualize_lights=visualize_lights,
+            restore_environment=False,
+            config_overrides=sequence_overrides,
+        )
+        renderer.render_relighting_sequence(
+            sequence_dir=args.relighting_sequence,
+            frame_stride=args.render_frame_stride,
+            light_scale=args.relighting_light_scale,
         )
     elif args.lights_relight:
         renderer = Renderer.from_checkpoint(

@@ -40,7 +40,7 @@ extern "C" __global__ void __raygen__rg() {
     path.accumulatedLightNoBrdf = make_float3(params.rayLight[idx.z][idx.y][idx.x][0], params.rayLight[idx.z][idx.y][idx.x][1], params.rayLight[idx.z][idx.y][idx.x][2]);
     path.accumulatedLightNoBrdfGrad = make_float3(params.rayLightGrad[idx.z][idx.y][idx.x][0], params.rayLightGrad[idx.z][idx.y][idx.x][1], params.rayLightGrad[idx.z][idx.y][idx.x][2]);
 
-    rayIntersect<false>(ray, path.currentRayPayload, sampler);
+    rayIntersectScene<false>(ray, path.currentRayPayload, sampler);
 
     if (path.currentRayPayload.interaction.valid) {
         path.currentRayPayload.interaction.materialGrad.dAlbedo += make_float3(params.rayMaterialGrad[idx.z][idx.y][idx.x][0], params.rayMaterialGrad[idx.z][idx.y][idx.x][1], params.rayMaterialGrad[idx.z][idx.y][idx.x][2]);
@@ -55,11 +55,12 @@ extern "C" __global__ void __raygen__rg() {
 #endif
 
 #ifdef ENABLE_MIS
-    sampleNee(path, sampler);
-    // NEE is accumulated at the primary surface in the forward pass, so its
-    // material gradient must be recorded here as well.  Keeping this outside
-    // the BRDF-continuation branch also makes max_bounces=0 differentiable.
-    accumulateNeeGradBwd(path, ray, path.currentRayPayload.interaction, params);
+    if (path.currentRayPayload.interaction.valid) {
+        sampleNee(path, sampler);
+        // Primary NEE material gradients preserve the established inversion
+        // behavior. Secondary NEE is an inference-oriented relighting option.
+        accumulateNeeGradBwd(path, ray, path.currentRayPayload.interaction, params);
+    }
 #endif
 
     for (unsigned int depth = 0; depth < params.maxBounces && path.active; ++depth) {
@@ -77,6 +78,7 @@ extern "C" __global__ void __raygen__rg() {
                     path.currentRayPayload.lastHitDistance,
                     path.currentRayPayload.interaction.materialGrad,
                     path.currentRayPayload.interaction.selectedParticleId,
+                    make_float3(0.0f),
                     params);
             }
             break;
@@ -89,8 +91,20 @@ extern "C" __global__ void __raygen__rg() {
 #ifdef ENABLE_RUSSIAN_ROULETTE
         if (!applyRussianRoulette(path, sampler)) { break; }
 #endif
-        rayIntersect<true>(path.currentRayPayload.ray, path.currentRayPayload, sampler);
+        rayIntersectScene<true>(path.currentRayPayload.ray, path.currentRayPayload, sampler);
+#ifdef ENABLE_MIS
+        if (params.enableSecondaryNee && path.currentRayPayload.interaction.valid) {
+            sampleNee(path, sampler);
+        } else {
+            path.emitterRayPayload = rayPayload();
+        }
+#endif
     }
+}
+
+extern "C" __global__ void __closesthit__mesh() {
+    optixSetPayload_0(optixGetPrimitiveIndex());
+    optixSetPayload_1(__float_as_uint(optixGetRayTmax()));
 }
 
 extern "C" __global__ void __intersection__is() {

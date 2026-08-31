@@ -25,8 +25,13 @@
 #include <3dgptir/pipelineParameters.h>
 
 static constexpr float kSelfOcclusionRayOriginOffset = 2e-2f;
-static constexpr float kMaxSelfOcclusionOffset = 1e-1f - kSelfOcclusionRayOriginOffset;
-static constexpr float kSelfOcclusionNormalDotThreshold = 0.1f;
+// MAX_SELF_OCCLUSION_OFFSET is always supplied by the host through NVRTC.
+// Keep the ray-origin offset subtraction in CUDA so this threshold is derived
+// at compile time on the device side.
+static constexpr float kMaxSelfOcclusionOffset =
+    MAX_SELF_OCCLUSION_OFFSET - kSelfOcclusionRayOriginOffset;
+static constexpr float kSelfOcclusionNormalDotThreshold = 0.0f;
+static constexpr float kSelfOcclusionInteractionNormalDotThreshold = 0.9f;
 static constexpr float kHardGeometryOpacityThreshold = 0.5f;
 
 #ifdef ENABLE_RUSSIAN_ROULETTE
@@ -68,6 +73,65 @@ struct RayHit {
     static constexpr float InfiniteDistance         = 1e20f;
 };
 using RayPayload = RayHit[PipelineParameters::MaxNumHitPerTrace];
+
+struct SceneMeshHit {
+    bool valid;
+    unsigned int triangleId;
+    float distance;
+};
+
+static __device__ __forceinline__ SceneMeshHit traceClosestSceneMesh(
+    const Ray& ray,
+    const float tmin = 0.0f,
+    const float tmax = RayHit::InfiniteDistance) {
+    SceneMeshHit hit;
+    hit.valid = false;
+    hit.triangleId = RayHit::InvalidParticleId;
+    hit.distance = RayHit::InfiniteDistance;
+    if (params.sceneMeshHandle == 0 || params.numSceneMeshTriangles == 0 || tmin >= tmax) {
+        return hit;
+    }
+
+    unsigned int triangleId = RayHit::InvalidParticleId;
+    unsigned int distance = __float_as_uint(RayHit::InfiniteDistance);
+    optixTrace(
+        params.sceneMeshHandle,
+        ray.origin,
+        ray.direction,
+        tmin,
+        tmax,
+        0.0f,
+        OptixVisibilityMask(255),
+        OPTIX_RAY_FLAG_DISABLE_ANYHIT,
+        1,
+        1,
+        0,
+        triangleId,
+        distance);
+
+    if (triangleId != RayHit::InvalidParticleId) {
+        hit.valid = true;
+        hit.triangleId = triangleId;
+        hit.distance = __uint_as_float(distance);
+    }
+    return hit;
+}
+
+static __device__ __forceinline__ SceneMeshHit traceClosestSurfaceMesh(const Ray& ray) {
+    float tmin = 0.0f;
+    for (unsigned int i = 0; i < params.numMeshLights; ++i) {
+        const SceneMeshHit hit = traceClosestSceneMesh(ray, tmin);
+        unsigned int meshId = 0u;
+        if (!hit.valid || !findSceneMesh(hit.triangleId, meshId)) {
+            return hit;
+        }
+        if (isSceneMeshSurface(meshId)) {
+            return hit;
+        }
+        tmin = hit.distance + 1e-4f;
+    }
+    return SceneMeshHit{false, RayHit::InvalidParticleId, RayHit::InfiniteDistance};
+}
 
 static __device__ __forceinline__ float misWeight(float pdfA, float pdfB) {
     const float a2 = pdfA * pdfA;
@@ -147,6 +211,7 @@ static __device__ __inline__ void trace(
 static __device__ __forceinline__ bool isSelfOcclusionHit(
     const RayHit& rayHit,
     const Ray& ray,
+    const float3& interactionShadingNormal,
     const float* particleShadingNormal) {
     if ((rayHit.distance > kMaxSelfOcclusionOffset) || (particleShadingNormal == nullptr)) {
         return false;
@@ -156,7 +221,11 @@ static __device__ __forceinline__ bool isSelfOcclusionHit(
         particleShadingNormal[rayHit.particleId * 3 + 0],
         particleShadingNormal[rayHit.particleId * 3 + 1],
         particleShadingNormal[rayHit.particleId * 3 + 2]);
-    return dot(shadingNormal, ray.direction) > kSelfOcclusionNormalDotThreshold;
+
+    // This heuristic condition is an additional interaction shadingnormal safeguard
+    // that reduces light leakage from poorly supervised GS normals.
+    return dot(shadingNormal, ray.direction) > kSelfOcclusionNormalDotThreshold
+        && dot(shadingNormal, interactionShadingNormal) > kSelfOcclusionInteractionNormalDotThreshold;
 }
 
 template <int ParticleKernelDegree = 4, bool SurfelPrimitive = false>
@@ -193,9 +262,17 @@ static __device__ __forceinline__ float shadowHitAlpha(
 template <bool EnableSelfOcclusionRejection = true>
 static __device__ __inline__ bool traceShadowMonteCarloOccluded(
     const Ray& ray,
+    const float3& interactionShadingNormal,
     Sampler& sampler,
     const float tmin = 0.0f,
     const float tmax = RayHit::InfiniteDistance) {
+    // This branch is uniform for a launch.  Gaussian-only inversion has a
+    // zero handle and pays no additional OptiX trace.
+    if (params.sceneMeshHandle != 0
+        && traceClosestSceneMesh(ray, tmin, tmax).valid) {
+        return true;
+    }
+
     constexpr float epsT = 1e-9f;
     const float2 minMaxT = intersectAABB(params.aabb, ray);
     float startT = fmaxf(tmin, minMaxT.x - epsT);
@@ -224,7 +301,11 @@ static __device__ __inline__ bool traceShadowMonteCarloOccluded(
             }
 
             batchEndT = fmaxf(batchEndT, rayHit.distance);
-            if (EnableSelfOcclusionRejection && isSelfOcclusionHit(rayHit, ray, params.particleShadingNormal)) {
+            if (EnableSelfOcclusionRejection && isSelfOcclusionHit(
+                    rayHit,
+                    ray,
+                    interactionShadingNormal,
+                    params.particleShadingNormal)) {
                 continue;
             }
 
@@ -249,16 +330,20 @@ template <bool EnableSelfOcclusionRejection>
 static __device__ __inline__ void rayIntersect(
     const Ray& ray,
     rayPayload& payload,
-    Sampler& sampler) {
+    Sampler& sampler,
+    const float rayMaxT = RayHit::InfiniteDistance) {
     constexpr float epsT = 1e-9;
-    const float2 minMaxT = intersectAABB(params.aabb, ray);
+    float2 minMaxT = intersectAABB(params.aabb, ray);
+    minMaxT.y = fminf(minMaxT.y, rayMaxT);
     RayPayload hitPayload;
 
 #ifdef ENABLE_MIS
     const float scatterPdf = payload.scatterPdf;
     const float lightPdf   = payload.lightPdf;
 #endif
+    const float3 interactionShadingNormal = payload.interactionShadingNormal;
     payload = rayPayload(ray, fmaxf(0.0f, minMaxT.x - epsT));
+    payload.interactionShadingNormal = interactionShadingNormal;
 #ifdef ENABLE_MIS
     payload.scatterPdf = scatterPdf;
     payload.lightPdf   = lightPdf;
@@ -295,7 +380,11 @@ static __device__ __inline__ void rayIntersect(
             const RayHit rayHit = hitPayload[i];
 
             if ((rayHit.particleId != RayHit::InvalidParticleId) && (payload.transmittance > params.minTransmittance)) {
-                if (EnableSelfOcclusionRejection && isSelfOcclusionHit(rayHit, payload.ray, params.particleShadingNormal)) {
+                if (EnableSelfOcclusionRejection && isSelfOcclusionHit(
+                        rayHit,
+                        payload.ray,
+                        payload.interactionShadingNormal,
+                        params.particleShadingNormal)) {
                     payload.lastHitDistance = fmaxf(payload.lastHitDistance, rayHit.distance);
                     continue;
                 }
@@ -388,6 +477,87 @@ static __device__ __inline__ void rayIntersect(
     }
 }
 
+template <bool EnableSelfOcclusionRejection>
+static __device__ __inline__ void rayIntersectScene(
+    const Ray& ray,
+    rayPayload& payload,
+    Sampler& sampler) {
+#ifdef ENABLE_VISUALIZE_LIGHTS
+    const SceneMeshHit meshHit = traceClosestSceneMesh(ray);
+#else
+    const SceneMeshHit meshHit = traceClosestSurfaceMesh(ray);
+#endif
+    unsigned int meshId = 0u;
+    const bool knownMesh = meshHit.valid && findSceneMesh(meshHit.triangleId, meshId);
+    const bool surfaceMesh = knownMesh && isSceneMeshSurface(meshId);
+#ifdef ENABLE_VISUALIZE_LIGHTS
+    const VisibleLightHit analyticLightHit = getVisibleLightHit(ray);
+    const bool meshIsNearest = knownMesh
+        && (!analyticLightHit.valid || meshHit.distance < analyticLightHit.dist);
+    const bool areaLightIsNearest = analyticLightHit.valid
+        && !analyticLightHit.isEnvironment
+        && (!knownMesh || analyticLightHit.dist <= meshHit.distance);
+    const float nearestEmitterDistance = meshIsNearest
+        ? meshHit.distance
+        : (analyticLightHit.valid ? analyticLightHit.dist : RayHit::InfiniteDistance);
+#else
+    const bool meshIsNearest = surfaceMesh;
+    const float nearestEmitterDistance = meshIsNearest
+        ? meshHit.distance
+        : RayHit::InfiniteDistance;
+#endif
+    rayIntersect<EnableSelfOcclusionRejection>(
+        ray,
+        payload,
+        sampler,
+        nearestEmitterDistance);
+#ifdef ENABLE_VISUALIZE_LIGHTS
+    payload.areaLightHit = areaLightIsNearest;
+#endif
+    if (meshIsNearest) {
+        payload.sceneMeshHit = true;
+        const float meshWeight = payload.transmittance;
+        payload.hitDistance += meshWeight * meshHit.distance;
+        payload.hitDistanceSecondMoment += meshWeight * meshHit.distance * meshHit.distance;
+        payload.depthDistortion = fmaxf(
+            payload.hitDistanceSecondMoment - payload.hitDistance * payload.hitDistance,
+            0.0f);
+        payload.lastHitDistance = meshHit.distance;
+
+        if (surfaceMesh && !payload.interaction.valid) {
+            float3 normal;
+            if (getSceneMeshNormal(meshHit.triangleId, ray.direction, normal)) {
+                payload.normal = normal;
+                payload.interaction = Interaction(
+                    ray.origin + ray.direction * meshHit.distance,
+                    normal,
+                    Material(
+                        make_float3(
+                            params.meshLights[meshId][8],
+                            params.meshLights[meshId][9],
+                            params.meshLights[meshId][10]),
+                        params.meshLights[meshId][11],
+                        params.meshLights[meshId][12]));
+                payload.hit = 1u;
+                payload.valid = false;
+            }
+        } else if (!surfaceMesh) {
+            getMeshLightTriangleEmission(
+                meshHit.triangleId,
+                ray.direction,
+                payload.sceneMeshEmission);
+            // An emissive mesh is terminal when no Gaussian surface precedes it.
+            // Accumulation applies the remaining Gaussian transmittance.
+            if (!payload.interaction.valid) {
+                payload.valid = true;
+            }
+        } else if (!payload.interaction.valid) {
+            // A degenerate normal still leaves the opaque mesh as a terminal hit.
+            payload.valid = true;
+        }
+    }
+}
+
 template <bool EnableSelfOcclusionRejection, typename PipelineParams>
 static __device__ __inline__ void rayIntersectBwd(
     const Ray& ray,
@@ -395,6 +565,7 @@ static __device__ __inline__ void rayIntersectBwd(
     const float rayMaxHitDistance,
     const MaterialGrad& materialGrad,
     const unsigned int selectedParticleId,
+    const float3& interactionShadingNormal,
     const PipelineParams& pipelineParams) {
 #ifdef ENABLE_DISCRETE_MODEL
     if (selectedParticleId == Interaction::InvalidParticleId) {
@@ -438,7 +609,11 @@ static __device__ __inline__ void rayIntersectBwd(
             const RayHit rayHit = hitPayload[i];
 
             if ((rayHit.particleId != RayHit::InvalidParticleId) && (rayTransmittance > pipelineParams.minTransmittance)) {
-                if (EnableSelfOcclusionRejection && isSelfOcclusionHit(rayHit, ray, pipelineParams.particleShadingNormal)) {
+                if (EnableSelfOcclusionRejection && isSelfOcclusionHit(
+                        rayHit,
+                        ray,
+                        interactionShadingNormal,
+                        pipelineParams.particleShadingNormal)) {
                     startT = fmaxf(startT, rayHit.distance);
                     continue;
                 }
@@ -499,6 +674,7 @@ static __device__ __inline__ void PendingRayDirectionGradBwd(
     const Ray pendingRay = pending.ray;
     const float pendingOpacity = pending.opacity;
     const float pendingMaxHitDistance = pending.maxHitDistance;
+    const float3 pendingInteractionShadingNormal = pending.interactionShadingNormal;
     const unsigned int pendingNumBounces = pending.numBounces;
     const unsigned int pendingSelectedParticleId = pending.selectedParticleId;
     path.pendingRayDirectionGrad.clear();
@@ -515,6 +691,7 @@ static __device__ __inline__ void PendingRayDirectionGradBwd(
             pendingMaxHitDistance,
             materialGrad,
             pendingSelectedParticleId,
+            pendingInteractionShadingNormal,
             pipelineParams);
     } else {
         rayIntersectBwd<false>(
@@ -523,6 +700,7 @@ static __device__ __inline__ void PendingRayDirectionGradBwd(
             pendingMaxHitDistance,
             materialGrad,
             pendingSelectedParticleId,
+            pendingInteractionShadingNormal,
             pipelineParams);
     }
 }
@@ -552,6 +730,7 @@ static __device__ __inline__ void sampleBrdfNextDirection(
     path.pathThroughput = nextPathThroughput;
     Ray nextRay(currentInteraction.position + safe_normalize(nextRayDirection) * kSelfOcclusionRayOriginOffset, nextRayDirection);
     path.currentRayPayload = rayPayload(nextRay, 0.0f);
+    path.currentRayPayload.interactionShadingNormal = currentInteraction.shadingnormal;
 #ifdef ENABLE_MIS
     path.currentRayPayload.scatterPdf = scatterPdf;
     path.currentRayPayload.lightPdf = lightSamplerPdf(currentInteraction.position, nextRay.direction);
@@ -589,9 +768,14 @@ static __device__ __inline__ void sampleNee(
         currentInteraction.position + lightDirection * kSelfOcclusionRayOriginOffset,
         lightDirection);
     const float shadowTmax = lightSample.dist < 1e19f
-        ? fmaxf(0.0f, lightSample.dist - kSelfOcclusionRayOriginOffset)
+        ? fmaxf(0.0f, lightSample.dist - kSelfOcclusionRayOriginOffset - 1e-4f)
         : RayHit::InfiniteDistance;
-    if (traceShadowMonteCarloOccluded<true>(lightRay, sampler, 0.0f, shadowTmax)) {
+    if (traceShadowMonteCarloOccluded<true>(
+            lightRay,
+            currentInteraction.shadingnormal,
+            sampler,
+            0.0f,
+            shadowTmax)) {
         path.emitterRayPayload = rayPayload();
         return;
     }
@@ -700,6 +884,7 @@ static __device__ __inline__ void sampleBrdfNextDirectionBwd(
             path.currentRayPayload.lastHitDistance,
             path.currentRayPayload.interaction.materialGrad,
             path.currentRayPayload.interaction.selectedParticleId,
+            path.currentRayPayload.interactionShadingNormal,
             pipelineParams);
     } else {
         rayIntersectBwd<false>(
@@ -708,6 +893,7 @@ static __device__ __inline__ void sampleBrdfNextDirectionBwd(
             path.currentRayPayload.lastHitDistance,
             path.currentRayPayload.interaction.materialGrad,
             path.currentRayPayload.interaction.selectedParticleId,
+            path.currentRayPayload.interactionShadingNormal,
             pipelineParams);
     }
 
@@ -720,6 +906,7 @@ static __device__ __inline__ void sampleBrdfNextDirectionBwd(
     path.pathThroughput = nextPathThroughput;
     Ray nextRay(currentInteraction.position + safe_normalize(nextRayDirection) * kSelfOcclusionRayOriginOffset, nextRayDirection);
     path.currentRayPayload = rayPayload(nextRay, 0.0f);
+    path.currentRayPayload.interactionShadingNormal = currentInteraction.shadingnormal;
 #ifdef ENABLE_MIS
     path.currentRayPayload.scatterPdf = scatterPdf;
     path.currentRayPayload.lightPdf = lightPdf;
@@ -732,7 +919,11 @@ static __device__ __inline__ void writePrimaryRayOutputs(
     params.rayRadiance[idx.z][idx.y][idx.x][0]    = payload.radiance.x;
     params.rayRadiance[idx.z][idx.y][idx.x][1]    = payload.radiance.y;
     params.rayRadiance[idx.z][idx.y][idx.x][2]    = payload.radiance.z;
-    params.rayDensity[idx.z][idx.y][idx.x][0]     = 1 - payload.transmittance;
+    // Opaque Mesh/Sphere emitters terminate primary rays. Gaussian
+    // transmittance only describes the volume in front of them.
+    params.rayDensity[idx.z][idx.y][idx.x][0]     = payload.sceneMeshHit || payload.areaLightHit
+        ? 1.0f
+        : 1.0f - payload.transmittance;
     params.rayHitDistance[idx.z][idx.y][idx.x][0] = payload.hitDistance;
     params.rayHitDistance[idx.z][idx.y][idx.x][1] = payload.lastHitDistance;
     params.rayHitDistanceSecondMoment[idx.z][idx.y][idx.x][0] = payload.hitDistanceSecondMoment;

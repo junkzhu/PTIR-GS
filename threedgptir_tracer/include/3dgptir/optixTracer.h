@@ -65,6 +65,16 @@ protected:
         CUdeviceptr gasBufferTmp;
         size_t gasBufferTmpSz;
 
+        // Optional triangle GAS used by mesh lights today and general scene
+        // meshes in the future.  A zero handle keeps the Gaussian-only fast
+        // path free of additional OptiX traces.
+        OptixTraversableHandle sceneMeshHandle;
+        CUdeviceptr sceneMeshBuffer;
+        size_t sceneMeshBufferSz;
+        CUdeviceptr sceneMeshBufferTmp;
+        size_t sceneMeshBufferTmpSz;
+        uint32_t sceneMeshNumTriangles;
+
         OptixAabb gasAABB;
         CUdeviceptr optixAabbPtr;
         CUdeviceptr paramsDevice;
@@ -102,6 +112,7 @@ protected:
     std::vector<std::string> generateDefines(
         float particleKernelDegree,
         bool particleKernelDensityClamping,
+        float maxSelfOcclusionOffset,
         int particleRadianceSphDegree,
         bool enableNormals,
         bool enableHitCounts,
@@ -125,6 +136,10 @@ protected:
     void reallocateBuffer(CUdeviceptr* bufferPtr, size_t& size, size_t newSize, cudaStream_t cudaStream);
     void reallocatePrimGeomBuffer(cudaStream_t stream);
     void reallocateParamsDevice(size_t sz, cudaStream_t stream);
+    void buildSceneMeshBVH(
+        const torch::Tensor& vertices,
+        const torch::Tensor& triangles,
+        cudaStream_t cudaStream);
 
     OptixTraversableHandle createParticleInstanceAS(cudaStream_t cudaStream);
 
@@ -138,6 +153,7 @@ public:
         float particleKernelDegree,
         float particleKernelMinResponse,
         bool particleKernelDensityClamping,
+        float maxSelfOcclusionOffset,
         int particleRadianceSphDegree,
         bool enableNormals,
         bool enableHitCounts,
@@ -171,7 +187,8 @@ public:
         uint32_t shIndirect,
         int sphDegree,
         float minTransmittance,
-        uint32_t maxBounces);
+        uint32_t maxBounces,
+        uint32_t enableSecondaryNee);
 
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> virtual traceBwd(
         uint32_t frameNumber,
@@ -215,7 +232,8 @@ public:
         uint32_t shIndirect,
         int sphDegree,
         float minTransmittance,
-        uint32_t maxBounces);
+        uint32_t maxBounces,
+        uint32_t enableSecondaryNee);
 
     virtual void buildBVH(torch::Tensor mogPos,
                           torch::Tensor mogRot,
@@ -223,4 +241,7 @@ public:
                           torch::Tensor mogDns,
                           unsigned int rebuild,
                           bool allow_update);
+    virtual void buildSceneMeshBVH(
+        torch::Tensor vertices,
+        torch::Tensor triangles);
 };

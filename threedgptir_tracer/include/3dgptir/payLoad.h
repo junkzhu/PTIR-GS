@@ -60,6 +60,10 @@ struct rayPayload {
         scatterPdf               = 0.f;
         lightPdf                 = 0.f;
         rayDirGrad               = make_float3(0.f);
+        interactionShadingNormal = make_float3(0.f);
+        sceneMeshEmission        = make_float3(0.f);
+        sceneMeshHit             = false;
+        areaLightHit             = false;
         hit                      = 0;
         valid                    = false;
     }
@@ -83,6 +87,14 @@ struct rayPayload {
     float lightPdf;
     float3 rayDirGrad;
 
+    // Shading normal of the interaction that emitted this secondary ray.
+    float3 interactionShadingNormal;
+
+    // Optional opaque emissive or PBR triangle behind the Gaussian interval.
+    float3 sceneMeshEmission;
+    bool sceneMeshHit;
+    bool areaLightHit;
+
     unsigned int hit;
     bool valid;
 };
@@ -98,6 +110,7 @@ struct PendingRayDirectionGrad {
         opacity = 0.f;
         maxHitDistance = 0.f;
         dNextDirDRoughness = make_float3(0.f);
+        interactionShadingNormal = make_float3(0.f);
         numBounces = 0u;
         selectedParticleId = Interaction::InvalidParticleId;
     }
@@ -107,6 +120,7 @@ struct PendingRayDirectionGrad {
         const float pendingOpacity,
         const float pendingMaxHitDistance,
         const float3& pendingDNextDirDRoughness,
+        const float3& pendingInteractionShadingNormal,
         const unsigned int pendingNumBounces,
         const unsigned int pendingSelectedParticleId) {
         const float gradLength2 =
@@ -118,6 +132,7 @@ struct PendingRayDirectionGrad {
         opacity = pendingOpacity;
         maxHitDistance = pendingMaxHitDistance;
         dNextDirDRoughness = pendingDNextDirDRoughness;
+        interactionShadingNormal = pendingInteractionShadingNormal;
         numBounces = pendingNumBounces;
         selectedParticleId = pendingSelectedParticleId;
     }
@@ -127,6 +142,7 @@ struct PendingRayDirectionGrad {
     float opacity;
     float maxHitDistance;
     float3 dNextDirDRoughness;
+    float3 interactionShadingNormal;
     unsigned int numBounces;
     unsigned int selectedParticleId;
 };

@@ -21,6 +21,7 @@ from enum import IntEnum
 
 import torch
 import torch.utils.cpp_extension
+from omegaconf import OmegaConf
 
 from threedgrut.datasets.protocols import Batch
 from threedgrut.model.filters import Filter
@@ -53,7 +54,7 @@ class LightBuffers:
             alias_table=torch.empty((5, 0), dtype=torch.float32, device=device),
             mesh_vertices=torch.empty((0, 3), dtype=torch.float32, device=device),
             mesh_triangles=torch.empty((0, 3), dtype=torch.int32, device=device),
-            mesh_lights=torch.empty((0, 8), dtype=torch.float32, device=device),
+            mesh_lights=torch.empty((0, 14), dtype=torch.float32, device=device),
             mesh_triangle_alias_table=torch.empty(
                 (3, 0), dtype=torch.float32, device=device
             ),
@@ -161,6 +162,7 @@ class Tracer:
             sph_degree,
             min_transmittance,
             max_bounces,
+            enable_secondary_nee,
         ):
             particle_density = torch.concat(
                 [mog_pos, mog_dns, mog_rot, mog_scl, torch.zeros_like(mog_dns)], dim=1
@@ -212,6 +214,7 @@ class Tracer:
                 sph_degree,
                 min_transmittance,
                 max_bounces,
+                int(enable_secondary_nee),
             )
             ctx.save_for_backward(
                 ray_to_world,
@@ -247,6 +250,7 @@ class Tracer:
             ctx.sph_degree = sph_degree
             ctx.min_transmittance = min_transmittance
             ctx.max_bounces = max_bounces
+            ctx.enable_secondary_nee = bool(enable_secondary_nee)
             ctx.tracer_wrapper = tracer_wrapper
             return (
                 ray_radiance,
@@ -363,6 +367,7 @@ class Tracer:
                 ctx.sph_degree,
                 ctx.min_transmittance,
                 ctx.max_bounces,
+                int(ctx.enable_secondary_nee),
             )
             mog_pos_grd, mog_dns_grd, mog_rot_grd, mog_scl_grd, _ = torch.split(
                 particle_density_grd, [3, 1, 4, 3, 1], dim=1
@@ -388,6 +393,7 @@ class Tracer:
                 environment_grd,
                 None,
                 sg_environment_grd,
+                None,
                 None,
                 None,
                 None,
@@ -442,11 +448,32 @@ class Tracer:
 
         self.device = "cuda"
         self.conf = conf
+        if OmegaConf.select(
+            self.conf, "render.enable_secondary_nee", default=None
+        ) is None:
+            OmegaConf.update(
+                self.conf,
+                "render.enable_secondary_nee",
+                True,
+                force_add=True,
+            )
         self.num_update_bvh = 0
+        self._scene_mesh_active = False
         self._warned_spp_fallback = False
         self._logged_spp_configs = set()
         self.pred_pbr_filter = Filter(self.conf.render.get("filter_type", "none"))
         self.visualize_lights = bool(self.conf.render.get("visualize_lights", False))
+        self.max_self_occlusion_offset = float(
+            self.conf.render.get("max_self_occlusion_offset", 0.1)
+        )
+        if (
+            not math.isfinite(self.max_self_occlusion_offset)
+            or self.max_self_occlusion_offset < 0.0
+        ):
+            raise ValueError(
+                "render.max_self_occlusion_offset must be a finite non-negative value, "
+                f"got {self.max_self_occlusion_offset}"
+            )
         self.max_bounces = int(self.conf.render.max_bounces)
         if self.max_bounces < 0:
             raise ValueError(
@@ -483,6 +510,7 @@ class Tracer:
             self.conf.render.particle_kernel_degree,
             self.conf.render.particle_kernel_min_response,
             self.conf.render.particle_kernel_density_clamping,
+            self.max_self_occlusion_offset,
             self.conf.render.particle_radiance_sph_degree,
             self.conf.render.enable_normals,
             self.conf.render.enable_hitcounts,
@@ -907,6 +935,20 @@ class Tracer:
                 gpu_batch,
                 device=gpu_batch.rays_dir.device,
             )
+            has_scene_mesh = light_buffers.mesh_triangles.numel() > 0
+            if has_scene_mesh:
+                self.tracer_wrapper.build_scene_mesh_bvh(
+                    light_buffers.mesh_vertices,
+                    light_buffers.mesh_triangles,
+                )
+                self._scene_mesh_active = True
+            elif self._scene_mesh_active:
+                self.tracer_wrapper.build_scene_mesh_bvh(
+                    light_buffers.mesh_vertices,
+                    light_buffers.mesh_triangles,
+                )
+                self._scene_mesh_active = False
+            enable_secondary_nee = self.conf.render.enable_secondary_nee
 
             def accumulate_output(name: str, value: torch.Tensor) -> None:
                 if accumulation_keys is not None and name not in accumulation_keys:
@@ -973,6 +1015,7 @@ class Tracer:
                     gaussians.n_active_features,
                     self.conf.render.min_transmittance,
                     native_max_bounces,
+                    enable_secondary_nee,
                 )
 
                 chunk_pred_rgb, chunk_pred_opacity = gaussians.background(

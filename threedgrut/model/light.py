@@ -45,7 +45,7 @@ LIGHT_TYPE_POINT = 1
 LIGHT_TYPE_SPHERE = 2
 LIGHT_TYPE_MESH = 3
 PACKED_LIGHT_SIZE = 9
-PACKED_MESH_LIGHT_SIZE = 8
+PACKED_MESH_LIGHT_SIZE = 14
 _DEFAULT_ENVIRONMENT_SIZE = (64, 128)
 
 
@@ -219,6 +219,10 @@ class Light(ABC):
                 triangles=data.get("triangles", data.get("faces", ())),
                 radiance=data.get("radiance", (1.0, 1.0, 1.0)),
                 two_sided=bool(data.get("two_sided", False)),
+                albedo=data.get("albedo", (0.8, 0.8, 0.8)),
+                roughness=data.get("roughness", 0.5),
+                metallic=data.get("metallic", 0.0),
+                surface=bool(data.get("surface", False)),
             )
         raise NotImplementedError(f"Light type '{light_type.name}' is not implemented yet.")
 
@@ -1818,11 +1822,11 @@ def build_mesh_light_triangle_alias_table(
 
 
 class MeshLight(Light):
-    """Triangle mesh area light.
+    """Triangle mesh emitter, optionally with a uniform PBR surface.
 
     Packed mesh-light layout:
         [triangle_offset, triangle_count, vertex_offset, vertex_count,
-         radiance.rgb, two_sided]
+         radiance.rgb, two_sided, albedo.rgb, roughness, metallic, surface]
     """
 
     PACKED_SIZE = PACKED_MESH_LIGHT_SIZE
@@ -1833,6 +1837,10 @@ class MeshLight(Light):
         triangles: torch.Tensor | Sequence[Sequence[int]],
         radiance: TensorLike = (1.0, 1.0, 1.0),
         two_sided: bool = False,
+        albedo: TensorLike = (0.8, 0.8, 0.8),
+        roughness: torch.Tensor | float = 0.5,
+        metallic: torch.Tensor | float = 0.0,
+        surface: bool = False,
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.float32,
     ) -> None:
@@ -1846,6 +1854,16 @@ class MeshLight(Light):
             radiance, "radiance", device=self.vertices.device, dtype=dtype
         )
         self.two_sided = bool(two_sided)
+        self.albedo = _as_vec3(
+            albedo, "albedo", device=self.vertices.device, dtype=dtype
+        )
+        self.roughness = _as_scalar(
+            roughness, "roughness", device=self.vertices.device, dtype=dtype
+        )
+        self.metallic = _as_scalar(
+            metallic, "metallic", device=self.vertices.device, dtype=dtype
+        )
+        self.surface = bool(surface)
         self._validate()
 
     @property
@@ -1875,6 +1893,13 @@ class MeshLight(Light):
             raise ValueError("triangles must contain at least one triangle.")
         if bool((self.radiance.detach() < 0.0).any().item()):
             raise ValueError("radiance must be non-negative.")
+        for name, value in (
+            ("albedo", self.albedo),
+            ("roughness", self.roughness),
+            ("metallic", self.metallic),
+        ):
+            if bool(((value.detach() < 0.0) | (value.detach() > 1.0)).any().item()):
+                raise ValueError(f"{name} must be in [0, 1].")
         if self.total_area() <= 0.0:
             raise ValueError("mesh light must contain at least one non-degenerate triangle.")
 
@@ -1913,6 +1938,12 @@ class MeshLight(Light):
                 float(self.radiance[1].detach().cpu().item()),
                 float(self.radiance[2].detach().cpu().item()),
                 1.0 if self.two_sided else 0.0,
+                float(self.albedo[0].detach().cpu().item()),
+                float(self.albedo[1].detach().cpu().item()),
+                float(self.albedo[2].detach().cpu().item()),
+                float(self.roughness[0].detach().cpu().item()),
+                float(self.metallic[0].detach().cpu().item()),
+                1.0 if self.surface else 0.0,
             ],
             dtype=dtype,
             device=device,
@@ -1930,6 +1961,10 @@ class MeshLight(Light):
             triangles=self.triangles.to(device=device),
             radiance=self.radiance.to(device=device, dtype=dtype),
             two_sided=self.two_sided,
+            albedo=self.albedo.to(device=device, dtype=dtype),
+            roughness=self.roughness.to(device=device, dtype=dtype),
+            metallic=self.metallic.to(device=device, dtype=dtype),
+            surface=self.surface,
         )
 
     def state_dict(self) -> dict[str, Any]:
@@ -1939,6 +1974,10 @@ class MeshLight(Light):
             "triangles": self.triangles.detach().clone(),
             "radiance": self.radiance.detach().clone(),
             "two_sided": self.two_sided,
+            "albedo": self.albedo.detach().clone(),
+            "roughness": self.roughness.detach().clone(),
+            "metallic": self.metallic.detach().clone(),
+            "surface": self.surface,
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
@@ -1959,6 +1998,25 @@ class MeshLight(Light):
             dtype=self.dtype,
         )
         self.two_sided = bool(state_dict.get("two_sided", self.two_sided))
+        self.albedo = _as_vec3(
+            state_dict.get("albedo", self.albedo),
+            "albedo",
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self.roughness = _as_scalar(
+            state_dict.get("roughness", self.roughness),
+            "roughness",
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self.metallic = _as_scalar(
+            state_dict.get("metallic", self.metallic),
+            "metallic",
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self.surface = bool(state_dict.get("surface", self.surface))
         self._validate()
 
     def to_dict(self) -> dict[str, Any]:
@@ -1968,6 +2026,10 @@ class MeshLight(Light):
             "triangles": self.triangles.detach().cpu().tolist(),
             "radiance": self.radiance.detach().cpu().tolist(),
             "two_sided": self.two_sided,
+            "albedo": self.albedo.detach().cpu().tolist(),
+            "roughness": float(self.roughness.detach().cpu().item()),
+            "metallic": float(self.metallic.detach().cpu().item()),
+            "surface": self.surface,
         }
 
 

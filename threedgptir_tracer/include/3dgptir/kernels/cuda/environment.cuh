@@ -790,14 +790,17 @@ static __device__ __forceinline__ VisibleLightHit getVisibleLightHit(const Ray& 
             nearest.radiance = radiance;
         }
     }
-    for (unsigned int i = 0; i < params.numMeshLights; ++i) {
-        float hitDistance = 1e20f;
-        float3 radiance = make_float3(0.0f);
-        if (intersectMeshAreaLight(ray, i, hitDistance, radiance) && hitDistance < nearest.dist) {
-            nearest.valid = true;
-            nearest.isEnvironment = false;
-            nearest.dist = hitDistance;
-            nearest.radiance = radiance;
+    // The optional triangle GAS supersedes the O(numTriangles) fallback.
+    if (params.sceneMeshHandle == 0) {
+        for (unsigned int i = 0; i < params.numMeshLights; ++i) {
+            float hitDistance = 1e20f;
+            float3 radiance = make_float3(0.0f);
+            if (intersectMeshAreaLight(ray, i, hitDistance, radiance) && hitDistance < nearest.dist) {
+                nearest.valid = true;
+                nearest.isEnvironment = false;
+                nearest.dist = hitDistance;
+                nearest.radiance = radiance;
+            }
         }
     }
 #endif
@@ -813,17 +816,32 @@ static __device__ __forceinline__ VisibleLightHit getVisibleLightHit(const Ray& 
     return nearest;
 }
 
+static __device__ __forceinline__ VisibleLightHit getPayloadVisibleLightHit(
+    const rayPayload& payload) {
+    if (!payload.sceneMeshHit) {
+        return getVisibleLightHit(payload.ray);
+    }
+    VisibleLightHit hit;
+    hit.valid = true;
+    hit.isEnvironment = false;
+    hit.dist = 0.0f;
+    hit.radiance = payload.sceneMeshEmission;
+    return hit;
+}
+
 static __device__ __forceinline__ void accumulateLightContribution(pathPayload& path) {
     path.currentRayPayload.contribution = make_float3(0.0f);
     const bool primarySurface = path.numBounces == 0u;
     const bool firstSecondaryBounce = path.numBounces == 1u;
+    const bool hasNeeForPreviousSurface =
+        firstSecondaryBounce || (params.enableSecondaryNee && path.numBounces > 1u);
 
 #ifdef ENABLE_MIS
-    const float brdfSideMis = firstSecondaryBounce
+    const float brdfSideMis = hasNeeForPreviousSurface
         ? misWeight(path.currentRayPayload.scatterPdf, path.currentRayPayload.lightPdf)
         : 1.0f;
-    const bool hasBrdfContinuation = path.maxBounces > 1u;
-    const float lightSideMis = primarySurface && hasBrdfContinuation
+    const bool hasBrdfContinuation = path.numBounces + 1u < path.maxBounces;
+    const float lightSideMis = hasBrdfContinuation
         ? misWeight(path.emitterRayPayload.lightPdf, path.emitterRayPayload.scatterPdf)
         : 1.0f;
     const float3 neeContribution = path.emitterRayPayload.contribution * lightSideMis;
@@ -831,21 +849,27 @@ static __device__ __forceinline__ void accumulateLightContribution(pathPayload& 
 
     if (params.renderOpts == 1) {
 #ifdef ENABLE_MIS
-        if (primarySurface) {
+        if (path.currentRayPayload.interaction.valid
+            && (primarySurface || params.enableSecondaryNee)) {
             path.accumulatedLighting += neeContribution;
+            if (primarySurface) {
+                path.accumulatedDirectLighting += neeContribution;
+            } else {
+                path.accumulatedIndirectLighting += neeContribution;
+            }
         }
 #endif
         if (path.numBounces > 0u && path.currentRayPayload.interaction.valid) {
             path.currentRayPayload.contribution = path.pathThroughput * path.currentRayPayload.radiance;
 #ifdef ENABLE_MIS
-            if (firstSecondaryBounce) {
+            if (hasNeeForPreviousSurface) {
                 path.currentRayPayload.contribution *= brdfSideMis;
             }
 #endif
             path.accumulatedLighting += path.currentRayPayload.contribution;
             path.accumulatedIndirectLighting += path.currentRayPayload.contribution;
         } else if (path.currentRayPayload.valid) {
-            const VisibleLightHit visibleLight = getVisibleLightHit(path.currentRayPayload.ray);
+            const VisibleLightHit visibleLight = getPayloadVisibleLightHit(path.currentRayPayload);
             if (!visibleLight.valid) {
                 return;
             }
@@ -854,7 +878,7 @@ static __device__ __forceinline__ void accumulateLightContribution(pathPayload& 
             path.accumulatedLightNoBrdf += visibleLight.radiance;
             path.currentRayPayload.contribution = path.pathThroughput * path.currentRayPayload.light;
 #ifdef ENABLE_MIS
-            if (firstSecondaryBounce) {
+            if (hasNeeForPreviousSurface) {
                 path.currentRayPayload.contribution *= brdfSideMis;
             }
 #endif
@@ -865,14 +889,19 @@ static __device__ __forceinline__ void accumulateLightContribution(pathPayload& 
     }
 
 #ifdef ENABLE_MIS
-    if (primarySurface) {
+    if (path.currentRayPayload.interaction.valid
+        && (primarySurface || params.enableSecondaryNee)) {
         path.accumulatedLighting += neeContribution;
-        path.accumulatedDirectLighting += neeContribution;
+        if (primarySurface) {
+            path.accumulatedDirectLighting += neeContribution;
+        } else {
+            path.accumulatedIndirectLighting += neeContribution;
+        }
     }
 #endif
 
     if (path.currentRayPayload.valid) {
-        const VisibleLightHit visibleLight = getVisibleLightHit(path.currentRayPayload.ray);
+        const VisibleLightHit visibleLight = getPayloadVisibleLightHit(path.currentRayPayload);
         if (!visibleLight.valid) {
             return;
         }
@@ -881,7 +910,7 @@ static __device__ __forceinline__ void accumulateLightContribution(pathPayload& 
         path.accumulatedLightNoBrdf += visibleLight.radiance;
         path.currentRayPayload.contribution = path.pathThroughput * path.currentRayPayload.light;
 #ifdef ENABLE_MIS
-        if (firstSecondaryBounce) {
+        if (hasNeeForPreviousSurface) {
             path.currentRayPayload.contribution *= brdfSideMis;
         }
 #endif
@@ -903,20 +932,23 @@ static __device__ __forceinline__ void accumulateLightContributionBwd(
     path.currentRayPayload.contribution = make_float3(0.0f);
     const bool primarySurface = path.numBounces == 0u;
     const bool firstSecondaryBounce = path.numBounces == 1u;
+    const bool hasNeeForPreviousSurface =
+        firstSecondaryBounce || (params.enableSecondaryNee && path.numBounces > 1u);
 
 #ifdef ENABLE_MIS
-    const float brdfSideMis = firstSecondaryBounce
+    const float brdfSideMis = hasNeeForPreviousSurface
         ? misWeight(path.currentRayPayload.scatterPdf, path.currentRayPayload.lightPdf)
         : 1.0f;
-    const bool hasBrdfContinuation = path.maxBounces > 1u;
-    const float lightSideMis = primarySurface && hasBrdfContinuation
+    const bool hasBrdfContinuation = path.numBounces + 1u < path.maxBounces;
+    const float lightSideMis = hasBrdfContinuation
         ? misWeight(path.emitterRayPayload.lightPdf, path.emitterRayPayload.scatterPdf)
         : 1.0f;
 #endif
 
     if (params.renderOpts == 1) {
 #ifdef ENABLE_MIS
-        if (primarySurface) {
+        if (path.currentRayPayload.interaction.valid
+            && (primarySurface || params.enableSecondaryNee)) {
             const float3 neeContribution = path.emitterRayPayload.contribution * lightSideMis;
             path.accumulatedLighting -= neeContribution;
         }
@@ -924,20 +956,20 @@ static __device__ __forceinline__ void accumulateLightContributionBwd(
         if (path.numBounces > 0u && path.currentRayPayload.interaction.valid) {
             path.currentRayPayload.contribution = path.pathThroughput * path.currentRayPayload.radiance;
 #ifdef ENABLE_MIS
-            if (firstSecondaryBounce) {
+            if (hasNeeForPreviousSurface) {
                 path.currentRayPayload.contribution *= brdfSideMis;
             }
 #endif
             path.accumulatedLighting -= path.currentRayPayload.contribution;
         } else if (path.currentRayPayload.valid) {
-            const VisibleLightHit visibleLight = getVisibleLightHit(path.currentRayPayload.ray);
+            const VisibleLightHit visibleLight = getPayloadVisibleLightHit(path.currentRayPayload);
             if (!visibleLight.valid) {
                 return;
             }
             path.pathThroughput *= path.currentRayPayload.transmittance;
             float3 environmentGrad = path.accumulatedLightingGrad * path.pathThroughput;
 #ifdef ENABLE_MIS
-            if (firstSecondaryBounce) {
+            if (hasNeeForPreviousSurface) {
                 environmentGrad *= brdfSideMis;
             }
 #endif
@@ -947,7 +979,7 @@ static __device__ __forceinline__ void accumulateLightContributionBwd(
                 : visibleLight.radiance;
             path.currentRayPayload.contribution = path.pathThroughput * visibleRadiance;
 #ifdef ENABLE_MIS
-            if (firstSecondaryBounce) {
+            if (hasNeeForPreviousSurface) {
                 path.currentRayPayload.contribution *= brdfSideMis;
             }
 #endif
@@ -957,14 +989,15 @@ static __device__ __forceinline__ void accumulateLightContributionBwd(
     }
 
 #ifdef ENABLE_MIS
-    if (primarySurface) {
+    if (path.currentRayPayload.interaction.valid
+        && (primarySurface || params.enableSecondaryNee)) {
         const float3 neeContribution = path.emitterRayPayload.contribution * lightSideMis;
         path.accumulatedLighting -= neeContribution;
     }
 #endif
 
     if (path.currentRayPayload.valid) {
-        const VisibleLightHit visibleLight = getVisibleLightHit(path.currentRayPayload.ray);
+        const VisibleLightHit visibleLight = getPayloadVisibleLightHit(path.currentRayPayload);
         if (!visibleLight.valid) {
             return;
         }
@@ -972,7 +1005,7 @@ static __device__ __forceinline__ void accumulateLightContributionBwd(
 
         float3 environmentGrad = path.accumulatedLightingGrad * path.pathThroughput;
 #ifdef ENABLE_MIS
-        if (firstSecondaryBounce) {
+        if (hasNeeForPreviousSurface) {
             environmentGrad *= brdfSideMis;
         }
 #endif
@@ -982,7 +1015,7 @@ static __device__ __forceinline__ void accumulateLightContributionBwd(
             : visibleLight.radiance;
         path.currentRayPayload.contribution = path.pathThroughput * visibleRadiance;
 #ifdef ENABLE_MIS
-        if (firstSecondaryBounce) {
+        if (hasNeeForPreviousSurface) {
             path.currentRayPayload.contribution *= brdfSideMis;
         }
 #endif

@@ -86,13 +86,45 @@ bash benchmark/tensoir.sh --cuda_device 0 --scenes "ficus"
 bash benchmark/synthetic4relight.sh --cuda_device 0 --scenes "hotdog"
 ```
 
+## Relighting Demo
+
+Run the included kitchen demo after setting paths to a base kitchen checkpoint,
+a new chair 3DGS checkpoint, and the Mip-NeRF 360 kitchen data. The bundled
+relighting sequence contains the animated lights and mirror geometry:
+
+```bash
+python scripts/playground/demo_compose_relighting.py \
+  --base-checkpoint path/to/data/kitchen_ckpt_last.pt \
+  --object-checkpoint path/to/data/chair_ckpt_last_scaled.pt \
+  --dataset path/to/data/kitchen \
+  --sequence scripts/playground/demo_seq \
+  --out-dir path/to/data/demo_seq
+```
+
+The demo writes `pbr`, `direct`, `indirect`, `light`, `albedo`, `roughness`,
+and `normals` frames and videos below a timestamped run directory rooted at
+`--out-dir`. The composed checkpoint is saved as `kitchen_chair_composed.pt`.
+See [the playground demo guide](scripts/playground/README.md) for prerequisites,
+checkpoint requirements, placement controls, JSON formats, and output layout.
+Override local paths or quality without editing the script:
+
+```bash
+python scripts/playground/demo_compose_relighting.py \
+  --base-checkpoint path/to/data/kitchen_ckpt_last.pt \
+  --object-checkpoint path/to/data/chair_ckpt_last_scaled.pt \
+  --dataset path/to/data/kitchen \
+  --sequence scripts/playground/demo_seq \
+  --out-dir path/to/data/demo_seq \
+  --spp 1024
+```
+
 Run arbitrary light relighting:
 ```bash
 CUDA_VISIBLE_DEVICES=0 python render.py \
-    --checkpoint path/to/ckpt_last.pt \
+    --checkpoint path/to/data/ckpt_last.pt \
     --path path/to/data \
-    --out-dir path/to/output \
-    --environment-path path/to/envmap.hdr \
+    --out-dir path/to/data/output \
+    --environment-path path/to/data/envmap.hdr \
     --lights-relight
 ```
 

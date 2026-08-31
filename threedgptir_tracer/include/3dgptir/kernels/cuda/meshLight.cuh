@@ -8,10 +8,14 @@
 #include <3dgptir/kernels/cuda/sampler.cuh>
 #include <3dgptir/mathUtils.h>
 
-static __device__ __forceinline__ bool hasMeshLightData() {
+static __device__ __forceinline__ bool hasSceneMeshData() {
     return params.numMeshLights > 0
         && params.numMeshLightVertices > 0
-        && params.numMeshLightTriangles > 0
+        && params.numMeshLightTriangles > 0;
+}
+
+static __device__ __forceinline__ bool hasMeshLightData() {
+    return hasSceneMeshData()
         && params.meshLightTriangleAliasTable.size(1) >= params.numMeshLightTriangles;
 }
 
@@ -48,6 +52,72 @@ static __device__ __forceinline__ bool getMeshLightTriangle(
         params.meshLightVertices[i2][0],
         params.meshLightVertices[i2][1],
         params.meshLightVertices[i2][2]);
+    return true;
+}
+
+static __device__ __forceinline__ bool findSceneMesh(
+    const unsigned int triangleId,
+    unsigned int& meshId) {
+    if (!hasSceneMeshData() || triangleId >= params.numMeshLightTriangles) {
+        return false;
+    }
+    for (meshId = 0; meshId < params.numMeshLights; ++meshId) {
+        const unsigned int offset = static_cast<unsigned int>(params.meshLights[meshId][0] + 0.5f);
+        const unsigned int count = static_cast<unsigned int>(params.meshLights[meshId][1] + 0.5f);
+        if (triangleId >= offset && triangleId < offset + count) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static __device__ __forceinline__ bool getSceneMeshNormal(
+    const unsigned int triangleId,
+    const float3 rayDirection,
+    float3& normal) {
+    float3 v0;
+    float3 v1;
+    float3 v2;
+    if (!getMeshLightTriangle(triangleId, v0, v1, v2)) {
+        return false;
+    }
+    normal = safe_normalize(cross(v1 - v0, v2 - v0));
+    if (dot(normal, -rayDirection) < 0.0f) {
+        normal = -normal;
+    }
+    return dot(normal, normal) > 0.0f;
+}
+
+static __device__ __forceinline__ bool isSceneMeshSurface(const unsigned int meshId) {
+    return meshId < params.numMeshLights
+        && params.meshLights.size(1) >= 14
+        && params.meshLights[meshId][13] > 0.5f;
+}
+
+static __device__ __forceinline__ bool getMeshLightTriangleEmission(
+    const unsigned int triangleId,
+    const float3 rayDirection,
+    float3& emission) {
+    emission = make_float3(0.0f);
+    unsigned int lightId;
+    if (!findSceneMesh(triangleId, lightId)) {
+        return false;
+    }
+
+    float3 v0;
+    float3 v1;
+    float3 v2;
+    if (!getMeshLightTriangle(triangleId, v0, v1, v2)) {
+        return true;
+    }
+    const float3 normal = safe_normalize(cross(v1 - v0, v2 - v0));
+    const bool twoSided = params.meshLights[lightId][7] > 0.5f;
+    if (twoSided || dot(normal, -rayDirection) > 1e-6f) {
+        emission = make_float3(
+            params.meshLights[lightId][4],
+            params.meshLights[lightId][5],
+            params.meshLights[lightId][6]);
+    }
     return true;
 }
 

@@ -36,7 +36,7 @@ extern "C" __global__ void __raygen__rg() {
 
     pathPayload path(1u, 0u, params.maxBounces);
 
-    rayIntersect<false>(ray, path.currentRayPayload, sampler);
+    rayIntersectScene<false>(ray, path.currentRayPayload, sampler);
     writePrimaryRayOutputs(idx, path.currentRayPayload);
 
 #ifndef ENABLE_VISUALIZE_LIGHTS
@@ -46,7 +46,9 @@ extern "C" __global__ void __raygen__rg() {
 #endif
 
 #ifdef ENABLE_MIS
-    sampleNee(path, sampler);
+    if (path.currentRayPayload.interaction.valid) {
+        sampleNee(path, sampler);
+    }
 #endif
 
     for (unsigned int depth = 0; depth < params.maxBounces && path.active; ++depth) {
@@ -68,11 +70,23 @@ extern "C" __global__ void __raygen__rg() {
             break;
         }
 #endif
-        rayIntersect<true>(path.currentRayPayload.ray, path.currentRayPayload, sampler);
+        rayIntersectScene<true>(path.currentRayPayload.ray, path.currentRayPayload, sampler);
+#ifdef ENABLE_MIS
+        if (params.enableSecondaryNee && path.currentRayPayload.interaction.valid) {
+            sampleNee(path, sampler);
+        } else {
+            path.emitterRayPayload = rayPayload();
+        }
+#endif
     }
 
     writePbrOutputs(idx, path);
 
+}
+
+extern "C" __global__ void __closesthit__mesh() {
+    optixSetPayload_0(optixGetPrimitiveIndex());
+    optixSetPayload_1(__float_as_uint(optixGetRayTmax()));
 }
 
 extern "C" __global__ void __intersection__is() {

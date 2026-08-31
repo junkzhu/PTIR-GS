@@ -10,11 +10,13 @@ particle_kernel_max_alpha: 0.99
 particle_radiance_sph_degree: 3
 primitive_type: instances
 min_transmittance: 0.001
+max_self_occlusion_offset: 0.1
 max_consecutive_bvh_update: 15
 visualize_lights: false
 enable_normals: true
 enable_hitcounts: true
 enable_mis: true
+enable_secondary_nee: true # Enable NEE at all path vertices after the primary camera hit
 discrete_model: false # Use stochastic discrete Gaussian surface interactions
 filter_type: atrous #support "none", "atrous"
 enable_metallic: ${model.optimize_material_metallic}

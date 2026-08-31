@@ -745,6 +745,10 @@ class MixtureOfGaussians(torch.nn.Module, ExportableModel):
             self.feature_dim_increase_step = checkpoint["feature_dim_increase_step"]
 
         self.background.load_state_dict(checkpoint["background"])
+        # init_from_checkpoint replaces registered Parameters outright.  Offline
+        # checkpoint tools often serialize CPU tensors, so the module's earlier
+        # device placement no longer applies to those replacements.
+        self.to(device=self.device)
         self.set_optimizable_parameters()
         if setup_optimizer:
             self.setup_optimizer(state_dict=checkpoint["optimizer"])

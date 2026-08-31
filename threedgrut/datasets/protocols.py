@@ -88,7 +88,7 @@ class Batch:
     light_alias_table: Optional[torch.Tensor] = None  # top-level light alias table [5, N]
     mesh_light_vertices: Optional[torch.Tensor] = None  # packed mesh-light vertices [V, 3]
     mesh_light_triangles: Optional[torch.Tensor] = None  # packed mesh-light triangles [T, 3]
-    mesh_lights: Optional[torch.Tensor] = None  # packed mesh-light params [M, 8]
+    mesh_lights: Optional[torch.Tensor] = None  # packed mesh-light PBR params [M, 14]
     mesh_light_triangle_alias_table: Optional[torch.Tensor] = None  # triangle alias table [3, T]
     prior: Optional[BatchPrior] = None
 
