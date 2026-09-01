@@ -104,6 +104,18 @@ composed `kitchen_chair_composed.pt` checkpoint are written under `--out-dir`.
 See [the playground demo guide](scripts/playground/README.md) for prerequisites
 and advanced options.
 
+Run arbitrary light relighting:
+```bash
+CUDA_VISIBLE_DEVICES=0 python render.py \
+    --checkpoint path/to/data/ckpt_last.pt \
+    --path path/to/data \
+    --out-dir path/to/data/output \
+    --environment-path path/to/data/envmap.hdr \
+    --lights-relight
+```
+
+The light setup is configured in `render.py` under `renderer.model.lights`.
+
 <p align="center">
   <img src="assets/garden.gif" width="49%">
   <img src="assets/kitchen.gif" width="49%">
