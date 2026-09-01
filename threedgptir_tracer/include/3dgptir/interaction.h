@@ -44,6 +44,7 @@ struct Interaction {
         this->shadingnormal = shadingnormal;
         this->material      = material;
         this->materialGrad  = MaterialGrad();
+        this->shadingNormalGrad = make_float3(0.f);
         this->selectedParticleId = InvalidParticleId;
     }
 
@@ -68,6 +69,7 @@ struct Interaction {
             integratedShadingnormal.z * invOpacity);
         material     = Material(integratedMaterial, invOpacity);
         materialGrad = MaterialGrad();
+        shadingNormalGrad = make_float3(0.f);
         selectedParticleId = InvalidParticleId;
     }
 #endif
@@ -77,5 +79,6 @@ struct Interaction {
     float3 shadingnormal;
     Material material;
     MaterialGrad materialGrad;
+    float3 shadingNormalGrad;
     unsigned int selectedParticleId;
 };

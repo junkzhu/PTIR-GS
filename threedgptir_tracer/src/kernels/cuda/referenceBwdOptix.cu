@@ -48,6 +48,10 @@ extern "C" __global__ void __raygen__rg() {
 #ifdef ENABLE_METALLIC
         path.currentRayPayload.interaction.materialGrad.dMetallic += params.rayMaterialGrad[idx.z][idx.y][idx.x][4];
 #endif
+        path.currentRayPayload.interaction.shadingNormalGrad += make_float3(
+            params.rayShadingNormalGrad[idx.z][idx.y][idx.x][0],
+            params.rayShadingNormalGrad[idx.z][idx.y][idx.x][1],
+            params.rayShadingNormalGrad[idx.z][idx.y][idx.x][2]);
     }
     
 #ifndef ENABLE_VISUALIZE_LIGHTS
@@ -77,6 +81,7 @@ extern "C" __global__ void __raygen__rg() {
                     1.0f - path.currentRayPayload.transmittance,
                     path.currentRayPayload.lastHitDistance,
                     path.currentRayPayload.interaction.materialGrad,
+                    path.currentRayPayload.interaction.shadingNormalGrad,
                     path.currentRayPayload.interaction.selectedParticleId,
                     make_float3(0.0f),
                     params);

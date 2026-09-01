@@ -564,6 +564,7 @@ static __device__ __inline__ void rayIntersectBwd(
     const float rayOpacity,
     const float rayMaxHitDistance,
     const MaterialGrad& materialGrad,
+    const float3& shadingNormalGrad,
     const unsigned int selectedParticleId,
     const float3& interactionShadingNormal,
     const PipelineParams& pipelineParams) {
@@ -580,12 +581,16 @@ static __device__ __inline__ void rayIntersectBwd(
 #ifdef ENABLE_METALLIC
     atomicAdd(&particleMaterialGrad.metallic, materialGrad.dMetallic);
 #endif
+    atomicAdd(&pipelineParams.particleShadingNormalGrad[selectedParticleId * 3 + 0], shadingNormalGrad.x);
+    atomicAdd(&pipelineParams.particleShadingNormalGrad[selectedParticleId * 3 + 1], shadingNormalGrad.y);
+    atomicAdd(&pipelineParams.particleShadingNormalGrad[selectedParticleId * 3 + 2], shadingNormalGrad.z);
 #else
     const float invRayOpacity = 1.0f / fmaxf(rayOpacity, 1e-12f);
     const Material rayMaterialGrad(
         materialGrad.dAlbedo * invRayOpacity,
         materialGrad.dRoughness * invRayOpacity,
         materialGrad.dMetallic * invRayOpacity);
+    const float3 rayShadingNormalGrad = shadingNormalGrad * invRayOpacity;
 
     constexpr float epsT = 1e-9;
     const float2 minMaxT = intersectAABB(pipelineParams.aabb, ray);
@@ -652,6 +657,9 @@ static __device__ __inline__ void rayIntersectBwd(
 #ifdef ENABLE_METALLIC
                     atomicAdd(&particleMaterialGrad.metallic, weight * rayMaterialGrad.metallic);
 #endif
+                    atomicAdd(&pipelineParams.particleShadingNormalGrad[rayHit.particleId * 3 + 0], weight * rayShadingNormalGrad.x);
+                    atomicAdd(&pipelineParams.particleShadingNormalGrad[rayHit.particleId * 3 + 1], weight * rayShadingNormalGrad.y);
+                    atomicAdd(&pipelineParams.particleShadingNormalGrad[rayHit.particleId * 3 + 2], weight * rayShadingNormalGrad.z);
                     rayTransmittance *= (1.0f - galpha);
                 }
                 startT = fmaxf(startT, rayHit.distance);
@@ -690,6 +698,7 @@ static __device__ __inline__ void PendingRayDirectionGradBwd(
             pendingOpacity,
             pendingMaxHitDistance,
             materialGrad,
+            make_float3(0.0f),
             pendingSelectedParticleId,
             pendingInteractionShadingNormal,
             pipelineParams);
@@ -699,6 +708,7 @@ static __device__ __inline__ void PendingRayDirectionGradBwd(
             pendingOpacity,
             pendingMaxHitDistance,
             materialGrad,
+            make_float3(0.0f),
             pendingSelectedParticleId,
             pendingInteractionShadingNormal,
             pipelineParams);
@@ -825,6 +835,10 @@ static __device__ __inline__ void accumulateNeeGradBwd(
     const float3 dLoss_dBrdf = path.accumulatedLightingGrad * path.pathThroughput * sampledLight * neeScale;
 
     path.currentRayPayload.interaction.materialGrad.dAlbedo += dLoss_dBrdf * brdfTimesCos.dBrdf_dAlbedo;
+    path.currentRayPayload.interaction.shadingNormalGrad += make_float3(
+        dot(dLoss_dBrdf, brdfTimesCos.dBrdf_dNormalX),
+        dot(dLoss_dBrdf, brdfTimesCos.dBrdf_dNormalY),
+        dot(dLoss_dBrdf, brdfTimesCos.dBrdf_dNormalZ));
 
     // NEE samples bright environment directions directly; enabling this roughness gradient can easily overfit specular highlights.
     //path.currentRayPayload.interaction.materialGrad.dRoughness += dot(dLoss_dBrdf, brdfTimesCos.dBrdf_dRoughness);
@@ -871,6 +885,10 @@ static __device__ __inline__ void sampleBrdfNextDirectionBwd(
             brdfThroughput.value.y > FastBrdfEps ? dLoss_dBrdfNumerator.y / brdfThroughput.value.y : 0.0f,
             brdfThroughput.value.z > FastBrdfEps ? dLoss_dBrdfNumerator.z / brdfThroughput.value.z : 0.0f);
         path.currentRayPayload.interaction.materialGrad.dAlbedo += dLoss_dBrdf * brdfThroughput.dBrdf_dAlbedo;
+        path.currentRayPayload.interaction.shadingNormalGrad += make_float3(
+            dot(dLoss_dBrdf, brdfThroughput.dBrdf_dNormalX),
+            dot(dLoss_dBrdf, brdfThroughput.dBrdf_dNormalY),
+            dot(dLoss_dBrdf, brdfThroughput.dBrdf_dNormalZ));
         path.currentRayPayload.interaction.materialGrad.dRoughness += dot(dLoss_dBrdf, brdfThroughput.dBrdf_dRoughness);
 #ifdef ENABLE_METALLIC
         path.currentRayPayload.interaction.materialGrad.dMetallic += dot(dLoss_dBrdf, brdfThroughput.dBrdf_dMetallic);
@@ -883,6 +901,7 @@ static __device__ __inline__ void sampleBrdfNextDirectionBwd(
             1.0f - path.currentRayPayload.transmittance,
             path.currentRayPayload.lastHitDistance,
             path.currentRayPayload.interaction.materialGrad,
+            path.currentRayPayload.interaction.shadingNormalGrad,
             path.currentRayPayload.interaction.selectedParticleId,
             path.currentRayPayload.interactionShadingNormal,
             pipelineParams);
@@ -892,6 +911,7 @@ static __device__ __inline__ void sampleBrdfNextDirectionBwd(
             1.0f - path.currentRayPayload.transmittance,
             path.currentRayPayload.lastHitDistance,
             path.currentRayPayload.interaction.materialGrad,
+            path.currentRayPayload.interaction.shadingNormalGrad,
             path.currentRayPayload.interaction.selectedParticleId,
             path.currentRayPayload.interactionShadingNormal,
             pipelineParams);

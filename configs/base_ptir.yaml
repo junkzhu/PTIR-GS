@@ -11,7 +11,7 @@ sh_indirect_iterations: 0
 
 model:
   freeze_geometry: true
-  optimize_shading_normal: false
+  optimize_shading_normal: true
   optimize_material_albedo: true
   optimize_material_roughness: true
   optimize_material_metallic: false
@@ -29,6 +29,8 @@ initialization:
 
 optimizer:
   params:
+    shading_normal:
+      lr: 0.001
     material_albedo:
       lr: 0.035
     material_roughness:

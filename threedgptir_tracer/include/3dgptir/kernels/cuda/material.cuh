@@ -277,7 +277,22 @@ struct FastBrdfValueGrad {
     float3 dBrdf_dMetallic;
     float3 dBrdf_dRoughness;
     float3 dNextDir_dRoughness;
+    // RGB Jacobian columns with respect to the normalized shading normal.
+    float3 dBrdf_dNormalX;
+    float3 dBrdf_dNormalY;
+    float3 dBrdf_dNormalZ;
 };
+
+static __device__ __forceinline__ void fast_brdf_zero_normal_grads(FastBrdfValueGrad& result) {
+    result.dBrdf_dNormalX = make_float3(0.0f);
+    result.dBrdf_dNormalY = make_float3(0.0f);
+    result.dBrdf_dNormalZ = make_float3(0.0f);
+}
+
+static __device__ __forceinline__ float3 fast_brdf_perturb_normal(
+    const float3& normal, const float3& delta) {
+    return fast_brdf_safe_normalize(normal + delta, normal);
+}
 
 static __device__ __forceinline__ float fast_brdf_nonnegative_grad_mask(const float v) {
 #ifdef FAST_BRDF_GUARD_NAN
@@ -295,6 +310,15 @@ static __device__ __forceinline__ float3 fast_brdf_nonnegative_grad_mask(const f
 }
 
 static __device__ __forceinline__ FastBrdfValueGrad eval_fast_brdf_light_sample_with_grads(
+    const float3& wo,
+    const float3& normal,
+    const float3& albedo,
+    const float metallic,
+    const float roughness,
+    const float3& lightDirection,
+    float& scatterPdf);
+
+static __device__ __forceinline__ float3 eval_fast_brdf_light_sample(
     const float3& wo,
     const float3& normal,
     const float3& albedo,
@@ -332,6 +356,7 @@ static __device__ __forceinline__ FastBrdfValueGrad sample_fast_brdf_throughput_
     result.dBrdf_dRoughness    = make_float3(0.0f);
     result.dBrdf_dMetallic     = make_float3(0.0f);
     result.dNextDir_dRoughness = make_float3(0.0f);
+    fast_brdf_zero_normal_grads(result);
 
     nextRayDirection = L;
     if (dot(normal, nextRayDirection) <= 0.0f) {
@@ -363,6 +388,22 @@ static __device__ __forceinline__ FastBrdfValueGrad sample_fast_brdf_throughput_
     // f / p through p without the matching score-function term is biased; the
     // unbiased detached-proposal estimator is (df / droughness) / p.
     result.dBrdf_dRoughness    = brdfTimesCos.dBrdf_dRoughness * invPdf * valueMask;
+    // Keep the sampled direction and proposal PDF detached, matching the
+    // material-gradient estimator above. Differentiate only f*cos at the
+    // realized direction. Central differences make this robust across the
+    // diffuse/GGX implementation without differentiating the RNG sampler.
+    constexpr float normalEps = 1.0e-3f;
+    const float invTwoNormalEps = 0.5f / normalEps;
+    float unusedPdf = 0.0f;
+    const float3 ex = make_float3(normalEps, 0.0f, 0.0f);
+    const float3 ey = make_float3(0.0f, normalEps, 0.0f);
+    const float3 ez = make_float3(0.0f, 0.0f, normalEps);
+    result.dBrdf_dNormalX = (eval_fast_brdf_light_sample(wo, fast_brdf_perturb_normal(normal, ex), albedo, metallic, roughness, nextRayDirection, unusedPdf) -
+                             eval_fast_brdf_light_sample(wo, fast_brdf_perturb_normal(normal, -ex), albedo, metallic, roughness, nextRayDirection, unusedPdf)) * invTwoNormalEps * invPdf * valueMask;
+    result.dBrdf_dNormalY = (eval_fast_brdf_light_sample(wo, fast_brdf_perturb_normal(normal, ey), albedo, metallic, roughness, nextRayDirection, unusedPdf) -
+                             eval_fast_brdf_light_sample(wo, fast_brdf_perturb_normal(normal, -ey), albedo, metallic, roughness, nextRayDirection, unusedPdf)) * invTwoNormalEps * invPdf * valueMask;
+    result.dBrdf_dNormalZ = (eval_fast_brdf_light_sample(wo, fast_brdf_perturb_normal(normal, ez), albedo, metallic, roughness, nextRayDirection, unusedPdf) -
+                             eval_fast_brdf_light_sample(wo, fast_brdf_perturb_normal(normal, -ez), albedo, metallic, roughness, nextRayDirection, unusedPdf)) * invTwoNormalEps * invPdf * valueMask;
 #ifdef ENABLE_METALLIC
     result.dBrdf_dMetallic     = brdfTimesCos.dBrdf_dMetallic * invPdf * valueMask;
 #endif
@@ -480,6 +521,7 @@ static __device__ __forceinline__ FastBrdfValueGrad eval_fast_brdf_light_sample_
     result.dBrdf_dRoughness = make_float3(0.0f);
     result.dBrdf_dMetallic = make_float3(0.0f);
     result.dNextDir_dRoughness = make_float3(0.0f);
+    fast_brdf_zero_normal_grads(result);
     if (NdotV <= 0.0f || NdotL <= 0.0f) {
         return result;
     }
@@ -553,6 +595,19 @@ static __device__ __forceinline__ FastBrdfValueGrad eval_fast_brdf_light_sample_
     const float dSpecularScale_dRough = (dD_dRough * G + D * dG_dRough) / fmaxf(4.0f * NdotV, FastBrdfEps);
     const float dRough_dInput = (roughness > FastBrdfMinRough && roughness < 1.0f) ? 1.0f : 0.0f;
     result.dBrdf_dRoughness = F * (dSpecularScale_dRough * dRough_dInput) * valueMask;
+
+    constexpr float normalEps = 1.0e-3f;
+    const float invTwoNormalEps = 0.5f / normalEps;
+    float unusedPdf = 0.0f;
+    const float3 ex = make_float3(normalEps, 0.0f, 0.0f);
+    const float3 ey = make_float3(0.0f, normalEps, 0.0f);
+    const float3 ez = make_float3(0.0f, 0.0f, normalEps);
+    result.dBrdf_dNormalX = (eval_fast_brdf_light_sample(wo, fast_brdf_perturb_normal(normal, ex), albedo, metallic, rough, lightDirection, unusedPdf) -
+                             eval_fast_brdf_light_sample(wo, fast_brdf_perturb_normal(normal, -ex), albedo, metallic, rough, lightDirection, unusedPdf)) * invTwoNormalEps * valueMask;
+    result.dBrdf_dNormalY = (eval_fast_brdf_light_sample(wo, fast_brdf_perturb_normal(normal, ey), albedo, metallic, rough, lightDirection, unusedPdf) -
+                             eval_fast_brdf_light_sample(wo, fast_brdf_perturb_normal(normal, -ey), albedo, metallic, rough, lightDirection, unusedPdf)) * invTwoNormalEps * valueMask;
+    result.dBrdf_dNormalZ = (eval_fast_brdf_light_sample(wo, fast_brdf_perturb_normal(normal, ez), albedo, metallic, rough, lightDirection, unusedPdf) -
+                             eval_fast_brdf_light_sample(wo, fast_brdf_perturb_normal(normal, -ez), albedo, metallic, rough, lightDirection, unusedPdf)) * invTwoNormalEps * valueMask;
 
     return result;
 }
