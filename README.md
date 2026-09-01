@@ -6,7 +6,7 @@
 
 ### [[Project]](https://junkzhu.github.io/project_pages/PTIR/) [[Paper]](https://arxiv.org/abs/2606.09606) 
           
-> [Junke Zhu](https://github.com/junkzhu), [Hao Zhang](https://github.com/0xrabbyte), [Yutian Zhu](https://rubatotree.github.io/academic/), [Ang Li](https://github.com/Alan-sp), [Chenxiao Hu](https://github.com/Hineven), [Meng Gai](https://cs.pku.edu.cn/info/1160/3584.htm), Fei Zhu, [Zhangjin Huang](http://staff.ustc.edu.cn/~zhuang/), [Sheng Li](https://lishengpku.github.io/)
+> [Junke Zhu](https://github.com/junkzhu), [Hao Zhang](https://github.com/0xrabbyte), [Yutian Zhu](https://rubatotree.github.io/academic/), [Ang Li](https://github.com/Alan-sp), [Chenxiao Hu](https://github.com/Hineven), [Meng Gai](https://cs.pku.edu.cn/info/1160/3584.htm), [Fei Zhu](https://feizhu.github.io/), [Zhangjin Huang](http://staff.ustc.edu.cn/~zhuang/), [Sheng Li](https://lishengpku.github.io/)
 
 ## Framework
 <p align="center">
@@ -88,9 +88,7 @@ bash benchmark/synthetic4relight.sh --cuda_device 0 --scenes "hotdog"
 
 ## Relighting Demo
 
-Run the included kitchen demo after setting paths to a base kitchen checkpoint,
-a new chair 3DGS checkpoint, and the Mip-NeRF 360 kitchen data. The bundled
-relighting sequence contains the animated lights and mirror geometry:
+Run the included kitchen demo with your checkpoint and dataset paths:
 
 ```bash
 python scripts/playground/demo_compose_relighting.py \
@@ -101,34 +99,10 @@ python scripts/playground/demo_compose_relighting.py \
   --out-dir path/to/data/demo_seq
 ```
 
-The demo writes `pbr`, `direct`, `indirect`, `light`, `albedo`, `roughness`,
-and `normals` frames and videos below a timestamped run directory rooted at
-`--out-dir`. The composed checkpoint is saved as `kitchen_chair_composed.pt`.
-See [the playground demo guide](scripts/playground/README.md) for prerequisites,
-checkpoint requirements, placement controls, JSON formats, and output layout.
-Override local paths or quality without editing the script:
-
-```bash
-python scripts/playground/demo_compose_relighting.py \
-  --base-checkpoint path/to/data/kitchen_ckpt_last.pt \
-  --object-checkpoint path/to/data/chair_ckpt_last_scaled.pt \
-  --dataset path/to/data/kitchen \
-  --sequence scripts/playground/demo_seq \
-  --out-dir path/to/data/demo_seq \
-  --spp 1024
-```
-
-Run arbitrary light relighting:
-```bash
-CUDA_VISIBLE_DEVICES=0 python render.py \
-    --checkpoint path/to/data/ckpt_last.pt \
-    --path path/to/data \
-    --out-dir path/to/data/output \
-    --environment-path path/to/data/envmap.hdr \
-    --lights-relight
-```
-
-The light setup is configured in `render.py` under `renderer.model.lights`.
+Outputs (including `pbr`, `direct`, `indirect`, and material buffers) and the
+composed `kitchen_chair_composed.pt` checkpoint are written under `--out-dir`.
+See [the playground demo guide](scripts/playground/README.md) for prerequisites
+and advanced options.
 
 <p align="center">
   <img src="assets/garden.gif" width="49%">
