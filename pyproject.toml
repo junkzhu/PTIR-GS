@@ -74,7 +74,13 @@ playground = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["threedgrut*", "threedgrt_tracer*", "threedgptir_tracer*", "threedgrut_playground*"]
+include = [
+    "threedgrut*",
+    "threedgrt_tracer*",
+    "threedgptir_tracer*",
+    "threedgrut_playground*",
+    "thirdparty.lpipsPyTorch*",
+]
 exclude = ["thirdparty*", ".venv*"]
 
 [tool.uv.sources]

@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from torchmetrics import PeakSignalNoiseRatio
 from torchmetrics.image import StructuralSimilarityIndexMeasure
-from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+from thirdparty.lpipsPyTorch.modules.lpips import LPIPS
 
 from threedgrut.model.ptir_helper import (
     append_ptir_metrics,
@@ -80,15 +80,17 @@ def create_psnr_criterion() -> torch.nn.Module:
     return PeakSignalNoiseRatio(data_range=1)
 
 
+def create_lpips_criterion() -> torch.nn.Module:
+    return LPIPS(net_type="vgg", version="0.1")
+
+
 def create_image_quality_criterions(
     device: str | torch.device = "cuda",
 ) -> dict[str, torch.nn.Module]:
     return {
         "psnr": create_psnr_criterion().to(device),
         "ssim": StructuralSimilarityIndexMeasure(data_range=1.0).to(device),
-        "lpips": LearnedPerceptualImagePatchSimilarity(
-            net_type="vgg", normalize=True
-        ).to(device),
+        "lpips": create_lpips_criterion().to(device),
     }
 
 

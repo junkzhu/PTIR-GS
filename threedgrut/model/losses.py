@@ -42,7 +42,7 @@ def masked_l2_loss(network_output, gt, mask=None, eps=1e-6):
 @torch.cuda.nvtx.range("ssim")
 def ssim(img1, img2, window_size=11, size_average=True):
     # predicted_image, gt_image: [BS, CH, H, W], predicted_image is differentiable
-    return fused_ssim(img1, img2, padding="valid")
+    return fused_ssim(img1, img2, padding="same")
 
 
 @torch.cuda.nvtx.range("pseudo_normal_loss")

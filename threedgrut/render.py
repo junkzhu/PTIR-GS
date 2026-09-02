@@ -22,11 +22,11 @@ import torch
 import torchvision
 from omegaconf import OmegaConf
 from torchmetrics.image import StructuralSimilarityIndexMeasure
-from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 import threedgrut.datasets as datasets
 from threedgrut.metric import (
     Metric,
+    create_lpips_criterion,
     create_psnr_criterion,
     write_relight_summary_to_metrics,
 )
@@ -1003,9 +1003,7 @@ class Renderer:
                     "ssim": StructuralSimilarityIndexMeasure(data_range=1.0).to(
                         "cuda"
                     ),
-                    "lpips": LearnedPerceptualImagePatchSimilarity(
-                        net_type="vgg", normalize=True
-                    ).to("cuda"),
+                    "lpips": create_lpips_criterion().to("cuda"),
                 }
 
         save_renders = not is_ptir
